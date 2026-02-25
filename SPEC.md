@@ -136,3 +136,6 @@ Defer or gate less-composable operators (platform/type-specific or niche) unless
 ## Learnings and ADRs
 - Project learnings are tracked in `LEARNINGS.md`.
 - Architectural decisions are recorded under `./adr` (e.g., `adr/adr-001-benchmark-codegen.md`).
+
+## Future Work
+- Add a size sweep mode to determine when benchmarks move from overhead-dominated to work-dominated. Run the same seed/count/depth across increasing sizes (e.g., 256, 512, 1024, 2048) and compare median forward time, median reverse time, and ratio stability to pick a default size.
