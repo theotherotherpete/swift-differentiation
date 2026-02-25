@@ -99,9 +99,7 @@ enum CodegenBench {
             print("codegen: seed=\(actualSeedHex) count=\(count) size=\(size) out=\(outputPath) emit=\(emittedPath) baseline=\(baselineCount)")
         }
 
-        if args.contains("--emit") {
-            let generator = SwiftSourceGenerator(seed: seed, size: size, depth: depth)
-            let source = generator.emitSource(count: count)
+        func writeGeneratedTests(source: String) {
             let emittedName = emittedPath
             do {
                 try FileManager.default.createDirectory(atPath: outputDirPath, withIntermediateDirectories: true)
@@ -117,6 +115,12 @@ enum CodegenBench {
                 print("wrote generated tests to \(emittedName)")
                 print("updated \(GeneratedTestsPath.project)")
             }
+        }
+
+        if args.contains("--emit") {
+            let generator = SwiftSourceGenerator(seed: seed, size: size, depth: depth)
+            let source = generator.emitSource(count: count)
+            writeGeneratedTests(source: source)
             return true
         }
 
@@ -134,15 +138,7 @@ enum CodegenBench {
                 }
                 let sourceGenerator = SwiftSourceGenerator(seed: seed, size: size, depth: depth)
                 let source = sourceGenerator.emitSource(count: count)
-                do {
-                    try FileManager.default.createDirectory(atPath: outputDirPath, withIntermediateDirectories: true)
-                    try source.write(to: URL(fileURLWithPath: emittedPath), atomically: true, encoding: .utf8)
-                    try source.write(to: URL(fileURLWithPath: GeneratedTestsPath.project), atomically: true, encoding: .utf8)
-                }
-                catch {
-                    StdErr.write("failed to write generated swift file: \(error)")
-                    exit(1)
-                }
+                writeGeneratedTests(source: source)
                 // Use in-memory generated tests for this run; compiled tests will match on next run.
                 let testGenerator = TestGenerator(seed: seed, size: size, depth: depth)
                 tests = baseline + (0 ..< count).map { index in testGenerator.makeTest(index: index) }
@@ -152,6 +148,12 @@ enum CodegenBench {
             }
         }
         else {
+            if verbose {
+                print("generated tests unavailable; generating for seed \(actualSeedHex)")
+            }
+            let sourceGenerator = SwiftSourceGenerator(seed: seed, size: size, depth: depth)
+            let source = sourceGenerator.emitSource(count: count)
+            writeGeneratedTests(source: source)
             let generator = TestGenerator(seed: seed, size: size, depth: depth)
             tests = baseline + (0 ..< count).map { index in generator.makeTest(index: index) }
         }
@@ -403,26 +405,22 @@ final class TestGenerator {
     }
 
     func makeTest(index: Int) -> GeneratedTestCase {
-        let choice = Int(rng.next() % 6)
-        switch choice {
-        case 0:
-            return makeMapMultiply(index: index)
-        case 1:
-            return makeZipMapAdd(index: index)
-        case 2:
-            return makeForIfDivide(index: index)
-        case 3:
-            return makeMinIf(index: index)
-        case 4:
-            return makeMaxIf(index: index)
-        default:
-            return makeAbsScale(index: index)
+        let kinds: [Int]
+        if maxDepth < 2 {
+            kinds = [0, 1]
         }
-    }
-
-    private func randomDepth() -> Int {
-        if maxDepth <= 1 { return 1 }
-        return 1 + Int(rng.next() % UInt64(maxDepth))
+        else {
+            kinds = [0, 1, 2]
+        }
+        let kind = kinds[Int(rng.next() % UInt64(kinds.count))]
+        switch kind {
+        case 0:
+            return makeScalarTest(index: index)
+        case 1:
+            return makeArrayTest(index: index)
+        default:
+            return makePairArrayTest(index: index)
+        }
     }
 
     private func randomArray(count: Int) -> [Float] {
@@ -453,106 +451,255 @@ final class TestGenerator {
         return randomDoubleArray(count: size)
     }
 
-    private func makeMapMultiply(index: Int) -> GeneratedTestCase {
-        let snippet = "map * reduce"
+    private enum ScalarVar {
+        case x
+        case a
+        case b
+    }
+
+    private indirect enum ScalarNode {
+        case variable(ScalarVar)
+        case constant(Float)
+        case abs(ScalarNode)
+        case min(ScalarNode, ScalarNode)
+        case max(ScalarNode, ScalarNode)
+        case op(String, ScalarNode, ScalarNode)
+        case cond(ScalarNode, ScalarNode, ScalarNode)
+
+        @differentiable(reverse, wrt: (xVal, aVal, bVal))
+        func eval(xVal: Float, aVal: Float, bVal: Float) -> Float {
+            switch self {
+            case .variable(let v):
+                switch v {
+                case .x: return xVal
+                case .a: return aVal
+                case .b: return bVal
+                }
+            case .constant(let c):
+                return c
+            case .abs(let n):
+                return Swift.abs(n.eval(xVal: xVal, aVal: aVal, bVal: bVal))
+            case .min(let left, let right):
+                return Swift.min(left.eval(xVal: xVal, aVal: aVal, bVal: bVal), right.eval(xVal: xVal, aVal: aVal, bVal: bVal))
+            case .max(let left, let right):
+                return Swift.max(left.eval(xVal: xVal, aVal: aVal, bVal: bVal), right.eval(xVal: xVal, aVal: aVal, bVal: bVal))
+            case .op(let op, let left, let right):
+                let av = left.eval(xVal: xVal, aVal: aVal, bVal: bVal)
+                let bv = right.eval(xVal: xVal, aVal: aVal, bVal: bVal)
+                switch op {
+                case "+": return av + bv
+                case "-": return av - bv
+                case "*": return av * bv
+                default: return av / bv
+                }
+            case .cond(let c, let t, let f):
+                return c.eval(xVal: xVal, aVal: aVal, bVal: bVal) > 0
+                    ? t.eval(xVal: xVal, aVal: aVal, bVal: bVal)
+                    : f.eval(xVal: xVal, aVal: aVal, bVal: bVal)
+            }
+        }
+    }
+
+    private func randomScalarNode(vars: [ScalarVar], ops: Int) -> ScalarNode {
+        if ops <= 0 {
+            let pickVar = Int(rng.next() % 2) == 0 && !vars.isEmpty
+            if pickVar {
+                return .variable(vars[Int(rng.next() % UInt64(vars.count))])
+            }
+            let value = Float(rng.nextDouble(in: -2.0, 2.0))
+            return .constant(value)
+        }
+        let choice = Int(rng.next() % 5)
+        let remaining = ops - 1
+        switch choice {
+        case 0:
+            let split = splitOps(remaining, parts: 2)
+            let a = randomScalarNode(vars: vars, ops: split[0])
+            let b = randomScalarNode(vars: vars, ops: split[1])
+            let op = ["+", "-", "*", "/"][Int(rng.next() % 4)]
+            return .op(op, a, b)
+        case 1:
+            let a = randomScalarNode(vars: vars, ops: remaining)
+            return .abs(a)
+        case 2:
+            let split = splitOps(remaining, parts: 2)
+            let a = randomScalarNode(vars: vars, ops: split[0])
+            let b = randomScalarNode(vars: vars, ops: split[1])
+            return .min(a, b)
+        case 3:
+            let split = splitOps(remaining, parts: 2)
+            let a = randomScalarNode(vars: vars, ops: split[0])
+            let b = randomScalarNode(vars: vars, ops: split[1])
+            return .max(a, b)
+        default:
+            let split = splitOps(remaining, parts: 3)
+            let c = randomScalarNode(vars: vars, ops: split[0])
+            let t = randomScalarNode(vars: vars, ops: split[1])
+            let f = randomScalarNode(vars: vars, ops: split[2])
+            return .cond(c, t, f)
+        }
+    }
+
+    private func describe(_ node: ScalarNode) -> String {
+        switch node {
+        case .variable:
+            return "var"
+        case .constant:
+            return "const"
+        case .abs(let n):
+            return "abs + \(describe(n))"
+        case .min(let a, let b):
+            return "min + \(describe(a)) + \(describe(b))"
+        case .max(let a, let b):
+            return "max + \(describe(a)) + \(describe(b))"
+        case .op(let op, let a, let b):
+            return "\(describe(a)) \(op) \(describe(b))"
+        case .cond(let c, let t, let f):
+            return "if + \(describe(c)) + \(describe(t)) + \(describe(f))"
+        }
+    }
+
+    private func randomOpsTarget() -> Int {
+        return randomOpsTarget(minimum: 1)
+    }
+
+    private func randomOpsTarget(minimum: Int) -> Int {
+        let minOps = max(1, minimum)
+        if maxDepth <= minOps { return maxDepth }
+        return minOps + Int(rng.next() % UInt64(maxDepth - minOps + 1))
+    }
+
+    private func splitOps(_ total: Int, parts: Int) -> [Int] {
+        guard parts > 1 else { return [max(0, total)] }
+        if total == 0 { return Array(repeating: 0, count: parts) }
+        var cuts: [Int] = []
+        cuts.reserveCapacity(parts - 1)
+        for _ in 0 ..< (parts - 1) {
+            cuts.append(Int(rng.next() % UInt64(total + 1)))
+        }
+        cuts.sort()
+        var result: [Int] = []
+        result.reserveCapacity(parts)
+        var last = 0
+        for cut in cuts {
+            result.append(cut - last)
+            last = cut
+        }
+        result.append(total - last)
+        return result
+    }
+
+    private func makeScalarTest(index: Int) -> GeneratedTestCase {
+        let input = Float(rng.nextDouble(in: -10.0, 10.0))
+        let node = randomScalarNode(vars: [.x], ops: randomOpsTarget())
+        let snippet = describe(node)
+        @differentiable(reverse)
+        func test(x: Float) -> Float {
+            let localNode = withoutDerivative(at: node)
+            return localNode.eval(xVal: x, aVal: 0, bVal: 0)
+        }
+        return GeneratedTestCase(
+            index: index,
+            snippet: snippet,
+            iterations: 200,
+            input: .scalarFloat(input),
+            forward: { _ = test(x: input) },
+            reverse: { _ = pullback(at: input, of: test)(1) }
+        )
+    }
+
+    private func makeArrayTest(index: Int) -> GeneratedTestCase {
         let input = makeInputArray()
+        let totalOps = randomOpsTarget()
+        let useMapReduce: Bool = totalOps <= 1 ? false : (Int(rng.next() % 2) == 0)
+        let arrayOps = useMapReduce ? 2 : 1
+        let remaining = max(0, totalOps - arrayOps)
+        let scalarOps = remaining == 0 ? 0 : Int(rng.next() % UInt64(remaining + 1))
+        let node = randomScalarNode(vars: [.x], ops: scalarOps)
+        let snippet = useMapReduce ? "array + map + reduce + \(describe(node))" : "array + for + \(describe(node))"
+        if useMapReduce {
+            @differentiable(reverse)
+            func test(values: [Float]) -> Float {
+                let localNode = withoutDerivative(at: node)
+                return values.differentiableMap { v in
+                    localNode.eval(xVal: v, aVal: 0, bVal: 0)
+                }.differentiableReduce(Float.zero, +)
+            }
+            return GeneratedTestCase(
+                index: index,
+                snippet: snippet,
+                iterations: 200,
+                input: .singleFloat(input),
+                forward: { _ = test(values: input) },
+                reverse: { _ = pullback(at: input, of: test)(1) }
+            )
+        }
+        @differentiable(reverse)
+        func test(values: [Float]) -> Float {
+            let localNode = withoutDerivative(at: node)
+            var sum: Float = 0
+            for i in 0 ..< withoutDerivative(at: values.count) {
+                let v = values[i]
+                sum += localNode.eval(xVal: v, aVal: 0, bVal: 0)
+            }
+            return sum
+        }
         return GeneratedTestCase(
             index: index,
             snippet: snippet,
             iterations: 200,
             input: .singleFloat(input),
-            forward: {
-                _ = mapMultiply(values: input)
-            },
-            reverse: {
-                _ = pullback(at: input, of: mapMultiply)(1)
-            }
+            forward: { _ = test(values: input) },
+            reverse: { _ = pullback(at: input, of: test)(1) }
         )
     }
 
-    private func makeZipMapAdd(index: Int) -> GeneratedTestCase {
-        let snippet = "zip + map + reduce"
+    private func makePairArrayTest(index: Int) -> GeneratedTestCase {
         let a = makeInputArray()
         let b = makeInputArray()
+        let totalOps = randomOpsTarget(minimum: 2)
+        let useMapReduce: Bool = totalOps <= 2 ? false : (Int(rng.next() % 2) == 0)
+        let arrayOps = useMapReduce ? 3 : 2
+        let remaining = max(0, totalOps - arrayOps)
+        let scalarOps = remaining == 0 ? 0 : Int(rng.next() % UInt64(remaining + 1))
+        let node = randomScalarNode(vars: [.a, .b], ops: scalarOps)
+        let snippet = useMapReduce ? "zip + map + \(describe(node))" : "zip + for + \(describe(node))"
+        if useMapReduce {
+            @differentiable(reverse)
+            func test(a: [Float], b: [Float]) -> Float {
+                let localNode = withoutDerivative(at: node)
+                return differentiableZip(a, b).differentiableMap { va, vb in
+                    localNode.eval(xVal: 0, aVal: va, bVal: vb)
+                }.differentiableReduce(Float.zero, +)
+            }
+            return GeneratedTestCase(
+                index: index,
+                snippet: snippet,
+                iterations: 200,
+                input: .pairFloat(a, b),
+                forward: { _ = test(a: a, b: b) },
+                reverse: { _ = pullback(at: a, b, of: test)(1) }
+            )
+        }
+        @differentiable(reverse)
+        func test(a: [Float], b: [Float]) -> Float {
+            let localNode = withoutDerivative(at: node)
+            let n = withoutDerivative(at: min(a.count, b.count))
+            var sum: Float = 0
+            for i in 0 ..< n {
+                let va = a[i]
+                let vb = b[i]
+                sum += localNode.eval(xVal: 0, aVal: va, bVal: vb)
+            }
+            return sum
+        }
         return GeneratedTestCase(
             index: index,
             snippet: snippet,
             iterations: 200,
             input: .pairFloat(a, b),
-            forward: {
-                _ = zipMapAdd(a: a, b: b)
-            },
-            reverse: {
-                _ = pullback(at: a, b, of: zipMapAdd)(1)
-            }
-        )
-    }
-
-    private func makeForIfDivide(index: Int) -> GeneratedTestCase {
-        let snippet = "for + if + /"
-        let input = makeInputArray()
-        return GeneratedTestCase(
-            index: index,
-            snippet: snippet,
-            iterations: 200,
-            input: .singleFloat(input),
-            forward: {
-                _ = forIfDivide(values: input)
-            },
-            reverse: {
-                _ = pullback(at: input, of: forIfDivide)(1)
-            }
-        )
-    }
-
-    private func makeMinIf(index: Int) -> GeneratedTestCase {
-        let snippet = "min + if"
-        let input = makeInputArray()
-        return GeneratedTestCase(
-            index: index,
-            snippet: snippet,
-            iterations: 200,
-            input: .singleFloat(input),
-            forward: {
-                _ = minIf(values: input)
-            },
-            reverse: {
-                _ = pullback(at: input, of: minIf)(1)
-            }
-        )
-    }
-
-    private func makeMaxIf(index: Int) -> GeneratedTestCase {
-        let snippet = "max + if"
-        let input = makeInputArray()
-        return GeneratedTestCase(
-            index: index,
-            snippet: snippet,
-            iterations: 200,
-            input: .singleFloat(input),
-            forward: {
-                _ = maxIf(values: input)
-            },
-            reverse: {
-                _ = pullback(at: input, of: maxIf)(1)
-            }
-        )
-    }
-
-    private func makeAbsScale(index: Int) -> GeneratedTestCase {
-        let snippet = "abs + map + *"
-        let input = makeInputArray()
-        return GeneratedTestCase(
-            index: index,
-            snippet: snippet,
-            iterations: 200,
-            input: .singleFloat(input),
-            forward: {
-                _ = absScale(values: input)
-            },
-            reverse: {
-                _ = pullback(at: input, of: absScale)(1)
-            }
+            forward: { _ = test(a: a, b: b) },
+            reverse: { _ = pullback(at: a, b, of: test)(1) }
         )
     }
 
