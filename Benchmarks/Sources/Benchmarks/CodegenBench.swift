@@ -9,7 +9,15 @@ import Glibc
 enum CodegenBench {
     static func runIfRequested() -> Bool {
         let args = CommandLine.arguments
-        if !args.contains("--codegen") && !args.contains("--seed") && !args.contains("--count") && !args.contains("--out") && !args.contains("--emit") {
+        if !args.contains("--codegen")
+            && !args.contains("--seed")
+            && !args.contains("--count")
+            && !args.contains("--size")
+            && !args.contains("--depth")
+            && !args.contains("--out")
+            && !args.contains("--emit")
+            && !args.contains("-v")
+            && !args.contains("--verbose") {
             return false
         }
 
