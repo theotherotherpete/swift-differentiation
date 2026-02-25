@@ -62,6 +62,11 @@ enum CodegenBench {
             }
         }
 
+        if depth < 1 {
+            StdErr.write("invalid --depth (must be >= 1)")
+            exit(1)
+        }
+
         let seed: Seed
         if let seedHex {
             guard let parsed = Seed(hex: seedHex) else {
@@ -110,11 +115,14 @@ enum CodegenBench {
         let tests: [GeneratedTestCase]
         let baseline = baselineTests(seed: seed, size: size)
         if generatedTestsIsAvailable {
-            let fileSeed = generatedTestsSeed
-            let seedMatches = (fileSeed == actualSeedHex)
-            if !seedMatches {
+            let seedMatches = (generatedTestsSeed == actualSeedHex)
+            let depthMatches = (generatedTestsDepth == nil || generatedTestsDepth == depth)
+            let sizeMatches = (generatedTestsSize == nil || generatedTestsSize == size)
+            let countMatches = (generatedTestsCount == nil || generatedTestsCount == count)
+            let metadataMatches = seedMatches && depthMatches && sizeMatches && countMatches
+            if !metadataMatches {
                 if verbose {
-                    print("seed mismatch or missing; regenerating generated tests for seed \(actualSeedHex)")
+                    print("generated tests metadata mismatch; regenerating for seed \(actualSeedHex)")
                 }
                 let sourceGenerator = SwiftSourceGenerator(seed: seed, size: size, depth: depth)
                 let source = sourceGenerator.emitSource(count: count)
@@ -725,6 +733,9 @@ final class SwiftSourceGenerator {
         lines.append("")
         lines.append("let generatedTestsIsAvailable: Bool = true")
         lines.append("let generatedTestsSeed: String? = \"\(seedHex)\"")
+        lines.append("let generatedTestsDepth: Int? = \(maxDepth)")
+        lines.append("let generatedTestsSize: Int? = \(size)")
+        lines.append("let generatedTestsCount: Int? = \(count)")
         lines.append("")
 
         var testEntries: [String] = []

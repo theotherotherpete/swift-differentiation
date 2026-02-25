@@ -26,7 +26,7 @@ Also include these differentiable operators/APIs from the repo where type-compat
 - `InlineArray` `read`, `update`, `+`, `-` (Swift 6.2+, macOS/iOS 26 only)
 - `runWithoutDerivative` (as a control / nonvarying baseline)
 
-Generate ordered combinations containing up to **`--depth` operators/constructs** (default 3) working together (e.g. `map` + `*` + `zip`, or `for` + `if` + `+`). Order matters (`if + map` is distinct from `map + if`).
+Generate ordered combinations containing up to **`--depth` operators/constructs** (default 3) working together (e.g. `map` + `*` + `zip`, or `for` + `if` + `+`). Order matters (`if + map` is distinct from `map + if`). `--depth N` creates test cases using between 1 and `N` nested operators and errors if `N < 1`.
 
 ## Non-goals
 - Proving mathematical correctness of derivatives beyond basic sanity checks.
