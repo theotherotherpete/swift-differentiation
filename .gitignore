@@ -9,3 +9,5 @@ DerivedData/
 .vscode
 Package.resolved
 .swift-version
+/Benchmarks/*.csv
+/Benchmarks/*.swift
