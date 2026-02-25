@@ -75,6 +75,16 @@ enum CodegenBench {
             exit(1)
         }
 
+        let coverageCount = requiredCoverageCount()
+        if depth < 2 {
+            StdErr.write("invalid --depth (must be >= 2 to satisfy operator coverage requirements)")
+            exit(1)
+        }
+        if count < coverageCount {
+            StdErr.write("invalid --count (must be >= \(coverageCount) to satisfy operator coverage requirements)")
+            exit(1)
+        }
+
         let seed: Seed
         if let seedHex {
             guard let parsed = Seed(hex: seedHex) else {
@@ -141,7 +151,12 @@ enum CodegenBench {
                 writeGeneratedTests(source: source)
                 // Use in-memory generated tests for this run; compiled tests will match on next run.
                 let testGenerator = TestGenerator(seed: seed, size: size, depth: depth)
-                tests = baseline + (0 ..< count).map { index in testGenerator.makeTest(index: index) }
+                let coverage = testGenerator.makeCoverageTests(startIndex: 0)
+                let remaining = max(0, count - coverage.count)
+                let randoms = (0 ..< remaining).map { index in
+                    testGenerator.makeTest(index: index + coverage.count)
+                }
+                tests = baseline + coverage + randoms
             }
             else {
                 tests = baseline + generatedTests
@@ -155,7 +170,12 @@ enum CodegenBench {
             let source = sourceGenerator.emitSource(count: count)
             writeGeneratedTests(source: source)
             let generator = TestGenerator(seed: seed, size: size, depth: depth)
-            tests = baseline + (0 ..< count).map { index in generator.makeTest(index: index) }
+            let coverage = generator.makeCoverageTests(startIndex: 0)
+            let remaining = max(0, count - coverage.count)
+            let randoms = (0 ..< remaining).map { index in
+                generator.makeTest(index: index + coverage.count)
+            }
+            tests = baseline + coverage + randoms
         }
 
         if verbose { print("benchmark: start") }
@@ -243,6 +263,21 @@ func atan2f(_ y: Float, _ x: Float) -> Float {
 #endif
 }
 
+@differentiable(reverse)
+private func atan2d(_ y: Float, _ x: Float) -> Float {
+    atan2f(y, x)
+}
+
+@derivative(of: atan2d)
+private func vjpAtan2d(_ y: Float, _ x: Float) -> (value: Float, pullback: (Float) -> (Float, Float)) {
+    let value = atan2f(y, x)
+    let denom = (x * x) + (y * y)
+    return (value, { v in
+        let scale = v / denom
+        return (scale * x, scale * -y)
+    })
+}
+
 @preconcurrency
 enum Blackhole {
     nonisolated(unsafe) private static var storage: Float = 0
@@ -316,6 +351,10 @@ enum Timing {
     }
 }
 
+private func requiredCoverageCount() -> Int {
+    return 14
+}
+
 // MARK: - Baseline tests
 
 @differentiable(reverse)
@@ -340,13 +379,67 @@ private func baselineMin(_ x: Float) -> Float { min(x, 0.25) }
 private func baselineMax(_ x: Float) -> Float { max(x, -0.25) }
 
 @differentiable(reverse)
+private func baselineAtan2(_ x: Float) -> Float { atan2d(x, 0.75) }
+
+@differentiable(reverse)
+private func baselineIf(_ x: Float) -> Float { x > 0 ? x : -x }
+
+@differentiable(reverse)
+private func baselineRunWithoutDerivative(_ x: Float) -> Float {
+    let y = withoutDerivative(at: x)
+    return y + x
+}
+
+@differentiable(reverse)
 private func baselineMapReduce(_ values: [Float]) -> Float {
     values.differentiableMap { $0 * 1.1 }.differentiableReduce(Float.zero, +)
 }
 
 @differentiable(reverse)
+private func baselineSeqMin(_ values: [Float]) -> Float {
+    values.differentiableMap { $0 }.min()!
+}
+
+@differentiable(reverse)
+private func baselineSeqMax(_ values: [Float]) -> Float {
+    values.differentiableMap { $0 }.max()!
+}
+
+@differentiable(reverse)
+private func baselineForSum(_ values: [Float]) -> Float {
+    var sum: Float = 0
+    for i in 0 ..< withoutDerivative(at: values.count) {
+        sum += values[i]
+    }
+    return sum
+}
+
+@differentiable(reverse)
 private func baselineZipMapReduce(_ a: [Float], _ b: [Float]) -> Float {
     differentiableZip(a, b).differentiableMap { $0 + $1 }.differentiableReduce(Float.zero, +)
+}
+
+@differentiable(reverse)
+private func baselineOptionalMap(_ x: Float) -> Float {
+    let opt: Float? = x
+    return opt.differentiableMap { $0 * 1.1 }!
+}
+
+@differentiable(reverse)
+private func baselineArrayUpdate(_ values: [Float]) -> Float {
+    var out = values
+    let idx = withoutDerivative(at: values.count / 2)
+    out.update(at: idx, with: out[idx] * 1.1)
+    return out.differentiableReduce(Float.zero, +)
+}
+
+@differentiable(reverse)
+private func baselineDictUpdate(_ dict: [Int: Float]) -> Float {
+    var out = dict
+    let key = withoutDerivative(at: 0)
+    let current = out[key]!
+    out.update(at: key, with: current * 1.1)
+    return out[key]!
 }
 
 private func baselineTests(seed: Seed, size: Int) -> [GeneratedTestCase] {
@@ -356,6 +449,11 @@ private func baselineTests(seed: Seed, size: Int) -> [GeneratedTestCase] {
     let values: [Float] = (0 ..< count).map { _ in Float(rng.nextDouble(in: -2.0, 2.0)) }
     let a: [Float] = (0 ..< count).map { _ in Float(rng.nextDouble(in: -2.0, 2.0)) }
     let b: [Float] = (0 ..< count).map { _ in Float(rng.nextDouble(in: -2.0, 2.0)) }
+    var dict: [Int: Float] = [:]
+    dict.reserveCapacity(count)
+    for i in 0 ..< count {
+        dict[i] = Float(rng.nextDouble(in: -2.0, 2.0))
+    }
     return [
         GeneratedTestCase(
             index: -1,
@@ -415,6 +513,30 @@ private func baselineTests(seed: Seed, size: Int) -> [GeneratedTestCase] {
         ),
         GeneratedTestCase(
             index: -8,
+            snippet: "baseline:atan2",
+            iterations: 400,
+            input: .scalarFloat(x),
+            forward: { sink(baselineAtan2(x)) },
+            reverse: { sink(pullback(at: x, of: baselineAtan2)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -9,
+            snippet: "baseline:if",
+            iterations: 400,
+            input: .scalarFloat(x),
+            forward: { sink(baselineIf(x)) },
+            reverse: { sink(pullback(at: x, of: baselineIf)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -10,
+            snippet: "baseline:runWithoutDerivative",
+            iterations: 400,
+            input: .scalarFloat(x),
+            forward: { sink(baselineRunWithoutDerivative(x)) },
+            reverse: { sink(pullback(at: x, of: baselineRunWithoutDerivative)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -11,
             snippet: "baseline:map+reduce",
             iterations: 200,
             input: .singleFloat(values),
@@ -422,12 +544,60 @@ private func baselineTests(seed: Seed, size: Int) -> [GeneratedTestCase] {
             reverse: { sink(pullback(at: values, of: baselineMapReduce)(1)) }
         ),
         GeneratedTestCase(
-            index: -9,
+            index: -12,
+            snippet: "baseline:seqMin",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineSeqMin(values)) },
+            reverse: { sink(pullback(at: values, of: baselineSeqMin)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -13,
+            snippet: "baseline:seqMax",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineSeqMax(values)) },
+            reverse: { sink(pullback(at: values, of: baselineSeqMax)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -14,
+            snippet: "baseline:for",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineForSum(values)) },
+            reverse: { sink(pullback(at: values, of: baselineForSum)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -15,
             snippet: "baseline:zip+map+reduce",
             iterations: 200,
             input: .pairFloat(a, b),
             forward: { sink(baselineZipMapReduce(a, b)) },
             reverse: { sink(pullback(at: a, b, of: baselineZipMapReduce)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -16,
+            snippet: "baseline:optional+map",
+            iterations: 400,
+            input: .scalarFloat(x),
+            forward: { sink(baselineOptionalMap(x)) },
+            reverse: { sink(pullback(at: x, of: baselineOptionalMap)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -17,
+            snippet: "baseline:array+update",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineArrayUpdate(values)) },
+            reverse: { sink(pullback(at: values, of: baselineArrayUpdate)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -18,
+            snippet: "baseline:dict+update",
+            iterations: 200,
+            input: .dictIntFloat(dict),
+            forward: { sink(baselineDictUpdate(dict)) },
+            reverse: { sink(pullback(at: dict, of: baselineDictUpdate)(1)) }
         ),
     ]
 }
@@ -485,6 +655,68 @@ final class TestGenerator {
             }
             return makeDictUpdateTest(index: index)
         }
+    }
+
+    func makeCoverageTests(startIndex: Int) -> [GeneratedTestCase] {
+        var tests: [GeneratedTestCase] = []
+        tests.reserveCapacity(requiredCoverageCount())
+        var index = startIndex
+
+        let plusAbs = ScalarNode.op("+", .abs(.variable(.x)), .constant(1.0))
+        tests.append(makeScalarCoverageTest(index: index, node: plusAbs))
+        index += 1
+
+        let minusMin = ScalarNode.min(.op("-", .variable(.x), .constant(1.0)), .variable(.x))
+        tests.append(makeScalarCoverageTest(index: index, node: minusMin))
+        index += 1
+
+        let mulMax = ScalarNode.max(.op("*", .variable(.x), .constant(1.5)), .variable(.x))
+        tests.append(makeScalarCoverageTest(index: index, node: mulMax))
+        index += 1
+
+        let divAtan2 = ScalarNode.atan2(.op("/", .variable(.x), .constant(1.3)), .variable(.x))
+        tests.append(makeScalarCoverageTest(index: index, node: divAtan2))
+        index += 1
+
+        let ifAbs = ScalarNode.cond(.variable(.x), .abs(.variable(.x)), .variable(.x))
+        tests.append(makeScalarCoverageTest(index: index, node: ifAbs))
+        index += 1
+
+        tests.append(makeRunWithoutDerivativeCoverageTest(index: index))
+        index += 1
+
+        let mapReduceNode = ScalarNode.variable(.x)
+        tests.append(makeArrayMapReduceCoverageTest(index: index, node: mapReduceNode))
+        index += 1
+
+        let seqMinNode = ScalarNode.variable(.x)
+        tests.append(makeArraySeqMinMaxCoverageTest(index: index, node: seqMinNode, useMax: false))
+        index += 1
+
+        let seqMaxNode = ScalarNode.variable(.x)
+        tests.append(makeArraySeqMinMaxCoverageTest(index: index, node: seqMaxNode, useMax: true))
+        index += 1
+
+        let forNode = ScalarNode.op("+", .variable(.x), .constant(1.0))
+        tests.append(makeArrayForCoverageTest(index: index, node: forNode))
+        index += 1
+
+        let zipNode = ScalarNode.op("+", .variable(.a), .variable(.b))
+        tests.append(makePairArrayMapReduceCoverageTest(index: index, node: zipNode))
+        index += 1
+
+        let optionalNode = ScalarNode.abs(.variable(.x))
+        tests.append(makeOptionalCoverageTest(index: index, node: optionalNode))
+        index += 1
+
+        let arrayUpdateNode = ScalarNode.max(.variable(.x), .constant(0.5))
+        tests.append(makeArrayUpdateCoverageTest(index: index, node: arrayUpdateNode))
+        index += 1
+
+        let dictUpdateNode = ScalarNode.atan2(.variable(.x), .constant(0.25))
+        tests.append(makeDictUpdateCoverageTest(index: index, node: dictUpdateNode))
+
+        return tests
     }
 
     private func randomArray(count: Int) -> [Float] {
@@ -567,7 +799,7 @@ final class TestGenerator {
                 default: return av / bv
                 }
             case .atan2(let y, let x):
-                return atan2f(y.eval(xVal: xVal, aVal: aVal, bVal: bVal), x.eval(xVal: xVal, aVal: aVal, bVal: bVal))
+                return atan2d(y.eval(xVal: xVal, aVal: aVal, bVal: bVal), x.eval(xVal: xVal, aVal: aVal, bVal: bVal))
             case .cond(let c, let t, let f):
                 return c.eval(xVal: xVal, aVal: aVal, bVal: bVal) > 0
                     ? t.eval(xVal: xVal, aVal: aVal, bVal: bVal)
@@ -745,6 +977,42 @@ final class TestGenerator {
         )
     }
 
+    private func makeScalarCoverageTest(index: Int, node: ScalarNode) -> GeneratedTestCase {
+        let input = Float(rng.nextDouble(in: -10.0, 10.0))
+        let snippet = describe(node)
+        @differentiable(reverse)
+        func test(x: Float) -> Float {
+            let localNode = withoutDerivative(at: node)
+            return localNode.eval(xVal: x, aVal: 0, bVal: 0)
+        }
+        return GeneratedTestCase(
+            index: index,
+            snippet: snippet,
+            iterations: 200,
+            input: .scalarFloat(input),
+            forward: { sink(test(x: input)) },
+            reverse: { sink(pullback(at: input, of: test)(1)) }
+        )
+    }
+
+    private func makeRunWithoutDerivativeCoverageTest(index: Int) -> GeneratedTestCase {
+        let input = Float(rng.nextDouble(in: -10.0, 10.0))
+        let snippet = "runWithoutDerivative + var + var"
+        @differentiable(reverse)
+        func test(x: Float) -> Float {
+            let y = withoutDerivative(at: x)
+            return y + x
+        }
+        return GeneratedTestCase(
+            index: index,
+            snippet: snippet,
+            iterations: 200,
+            input: .scalarFloat(input),
+            forward: { sink(test(x: input)) },
+            reverse: { sink(pullback(at: input, of: test)(1)) }
+        )
+    }
+
     private func makeArrayTest(index: Int) -> GeneratedTestCase {
         let input = makeInputArray()
         let totalOps = randomOpsTarget()
@@ -822,9 +1090,94 @@ final class TestGenerator {
         )
     }
 
+    private func makeArrayMapReduceCoverageTest(index: Int, node: ScalarNode) -> GeneratedTestCase {
+        let input = makeInputArray()
+        let snippet = "array + map + reduce + \(describe(node))"
+        @differentiable(reverse)
+        func test(values: [Float]) -> Float {
+            let localNode = withoutDerivative(at: node)
+            return values.differentiableMap { v in
+                localNode.eval(xVal: v, aVal: 0, bVal: 0)
+            }.differentiableReduce(Float.zero, +)
+        }
+        return GeneratedTestCase(
+            index: index,
+            snippet: snippet,
+            iterations: 200,
+            input: .singleFloat(input),
+            forward: { sink(test(values: input)) },
+            reverse: { sink(pullback(at: input, of: test)(1)) }
+        )
+    }
+
+    private func makeArraySeqMinMaxCoverageTest(index: Int, node: ScalarNode, useMax: Bool) -> GeneratedTestCase {
+        let input = makeInputArray()
+        let snippet = "array + map + seq\(useMax ? "Max" : "Min") + \(describe(node))"
+        @differentiable(reverse)
+        func test(values: [Float]) -> Float {
+            let localNode = withoutDerivative(at: node)
+            let mapped = values.differentiableMap { v in
+                localNode.eval(xVal: v, aVal: 0, bVal: 0)
+            }
+            return useMax ? mapped.max()! : mapped.min()!
+        }
+        return GeneratedTestCase(
+            index: index,
+            snippet: snippet,
+            iterations: 200,
+            input: .singleFloat(input),
+            forward: { sink(test(values: input)) },
+            reverse: { sink(pullback(at: input, of: test)(1)) }
+        )
+    }
+
+    private func makeArrayForCoverageTest(index: Int, node: ScalarNode) -> GeneratedTestCase {
+        let input = makeInputArray()
+        let snippet = "array + for + \(describe(node))"
+        @differentiable(reverse)
+        func test(values: [Float]) -> Float {
+            let localNode = withoutDerivative(at: node)
+            var sum: Float = 0
+            for i in 0 ..< withoutDerivative(at: values.count) {
+                let v = values[i]
+                sum += localNode.eval(xVal: v, aVal: 0, bVal: 0)
+            }
+            return sum
+        }
+        return GeneratedTestCase(
+            index: index,
+            snippet: snippet,
+            iterations: 200,
+            input: .singleFloat(input),
+            forward: { sink(test(values: input)) },
+            reverse: { sink(pullback(at: input, of: test)(1)) }
+        )
+    }
+
     private func makeOptionalTest(index: Int) -> GeneratedTestCase {
         let input = Float(rng.nextDouble(in: -10.0, 10.0))
         let node = ensureVariable(randomScalarNode(vars: [.x], ops: randomOpsTarget()), vars: [.x])
+        let snippet = "optional + map + \(describe(node))"
+        @differentiable(reverse)
+        func test(x: Float) -> Float {
+            let localNode = withoutDerivative(at: node)
+            let opt: Float? = x
+            return opt.differentiableMap { v in
+                localNode.eval(xVal: v, aVal: 0, bVal: 0)
+            }!
+        }
+        return GeneratedTestCase(
+            index: index,
+            snippet: snippet,
+            iterations: 200,
+            input: .scalarFloat(input),
+            forward: { sink(test(x: input)) },
+            reverse: { sink(pullback(at: input, of: test)(1)) }
+        )
+    }
+
+    private func makeOptionalCoverageTest(index: Int, node: ScalarNode) -> GeneratedTestCase {
+        let input = Float(rng.nextDouble(in: -10.0, 10.0))
         let snippet = "optional + map + \(describe(node))"
         @differentiable(reverse)
         func test(x: Float) -> Float {
@@ -868,9 +1221,55 @@ final class TestGenerator {
         )
     }
 
+    private func makeArrayUpdateCoverageTest(index: Int, node: ScalarNode) -> GeneratedTestCase {
+        let input = makeInputArray()
+        let snippet = "array + update + \(describe(node))"
+        @differentiable(reverse)
+        func test(values: [Float]) -> Float {
+            var out = values
+            let idx = withoutDerivative(at: values.count / 2)
+            let localNode = withoutDerivative(at: node)
+            let current = out[idx]
+            let newValue = localNode.eval(xVal: current, aVal: 0, bVal: 0)
+            out.update(at: idx, with: newValue)
+            return out.differentiableReduce(Float.zero, +)
+        }
+        return GeneratedTestCase(
+            index: index,
+            snippet: snippet,
+            iterations: 200,
+            input: .singleFloat(input),
+            forward: { sink(test(values: input)) },
+            reverse: { sink(pullback(at: input, of: test)(1)) }
+        )
+    }
+
     private func makeDictUpdateTest(index: Int) -> GeneratedTestCase {
         let input = makeInputDictionary()
         let node = ensureVariable(randomScalarNode(vars: [.x], ops: randomOpsTarget()), vars: [.x])
+        let snippet = "dict + update + \(describe(node))"
+        @differentiable(reverse)
+        func test(dict: [Int: Float]) -> Float {
+            var out = dict
+            let key = withoutDerivative(at: 0)
+            let localNode = withoutDerivative(at: node)
+            let current = out[key]!
+            let newValue = localNode.eval(xVal: current, aVal: 0, bVal: 0)
+            out.update(at: key, with: newValue)
+            return out[key]!
+        }
+        return GeneratedTestCase(
+            index: index,
+            snippet: snippet,
+            iterations: 200,
+            input: .dictIntFloat(input),
+            forward: { sink(test(dict: input)) },
+            reverse: { sink(pullback(at: input, of: test)(1)) }
+        )
+    }
+
+    private func makeDictUpdateCoverageTest(index: Int, node: ScalarNode) -> GeneratedTestCase {
+        let input = makeInputDictionary()
         let snippet = "dict + update + \(describe(node))"
         @differentiable(reverse)
         func test(dict: [Int: Float]) -> Float {
@@ -941,7 +1340,26 @@ final class TestGenerator {
         )
     }
 
-    // Note: no optional or atan2 variants in fallback; those are covered by emitted code.
+    private func makePairArrayMapReduceCoverageTest(index: Int, node: ScalarNode) -> GeneratedTestCase {
+        let a = makeInputArray()
+        let b = makeInputArray()
+        let snippet = "zip + map + \(describe(node))"
+        @differentiable(reverse)
+        func test(a: [Float], b: [Float]) -> Float {
+            let localNode = withoutDerivative(at: node)
+            return differentiableZip(a, b).differentiableMap { va, vb in
+                localNode.eval(xVal: 0, aVal: va, bVal: vb)
+            }.differentiableReduce(Float.zero, +)
+        }
+        return GeneratedTestCase(
+            index: index,
+            snippet: snippet,
+            iterations: 200,
+            input: .pairFloat(a, b),
+            forward: { sink(test(a: a, b: b)) },
+            reverse: { sink(pullback(at: a, b, of: test)(1)) }
+        )
+    }
 }
 
 // MARK: - Generated test functions
@@ -1124,6 +1542,21 @@ final class SwiftSourceGenerator {
         lines.append("import Differentiation")
         lines.append("import Foundation")
         lines.append("")
+        lines.append("@differentiable(reverse)")
+        lines.append("private func atan2d(_ y: Float, _ x: Float) -> Float {")
+        lines.append("    return atan2(y, x)")
+        lines.append("}")
+        lines.append("")
+        lines.append("@derivative(of: atan2d)")
+        lines.append("private func vjpAtan2d(_ y: Float, _ x: Float) -> (value: Float, pullback: (Float) -> (Float, Float)) {")
+        lines.append("    let value = atan2(y, x)")
+        lines.append("    let denom = (x * x) + (y * y)")
+        lines.append("    return (value, { v in")
+        lines.append("        let scale = v / denom")
+        lines.append("        return (scale * x, scale * -y)")
+        lines.append("    })")
+        lines.append("}")
+        lines.append("")
         lines.append("let generatedTestsIsAvailable: Bool = true")
         lines.append("let generatedTestsSeed: String? = \"\(seedHex)\"")
         lines.append("let generatedTestsDepth: Int? = \(maxDepth)")
@@ -1134,8 +1567,15 @@ final class SwiftSourceGenerator {
         var testEntries: [String] = []
         testEntries.reserveCapacity(count)
 
-        for index in 0 ..< count {
-            emitRandomTest(index: index, lines: &lines, entries: &testEntries)
+        let coverageCount = requiredCoverageCount()
+        let nextIndex = emitCoverageTests(startIndex: 0, lines: &lines, entries: &testEntries)
+        if nextIndex != coverageCount {
+            StdErr.write("warning: expected coverage count \(coverageCount), got \(nextIndex)")
+        }
+        if nextIndex < count {
+            for index in nextIndex ..< count {
+                emitRandomTest(index: index, lines: &lines, entries: &testEntries)
+            }
         }
 
         lines.append("let generatedTests: [GeneratedTestCase] = [")
@@ -1168,6 +1608,253 @@ final class SwiftSourceGenerator {
         default:
             emitDictUpdateTest(index: index, lines: &lines, entries: &entries)
         }
+    }
+
+    private func emitCoverageTests(startIndex: Int, lines: inout [String], entries: inout [String]) -> Int {
+        var index = startIndex
+
+        emitScalarCoverageTest(index: index, lines: &lines, entries: &entries) { varName in
+            .op("+", .abs(.variable(varName)), .constant("Float(1.0)"))
+        }
+        index += 1
+
+        emitScalarCoverageTest(index: index, lines: &lines, entries: &entries) { varName in
+            .min(.op("-", .variable(varName), .constant("Float(1.0)")), .variable(varName))
+        }
+        index += 1
+
+        emitScalarCoverageTest(index: index, lines: &lines, entries: &entries) { varName in
+            .max(.op("*", .variable(varName), .constant("Float(1.5)")), .variable(varName))
+        }
+        index += 1
+
+        emitScalarCoverageTest(index: index, lines: &lines, entries: &entries) { varName in
+            .atan2(.op("/", .variable(varName), .constant("Float(1.3)")), .variable(varName))
+        }
+        index += 1
+
+        emitScalarCoverageTest(index: index, lines: &lines, entries: &entries) { varName in
+            .cond(.variable(varName), .abs(.variable(varName)), .variable(varName))
+        }
+        index += 1
+
+        emitRunWithoutDerivativeCoverageTest(index: index, lines: &lines, entries: &entries)
+        index += 1
+
+        emitArrayMapReduceCoverageTest(index: index, lines: &lines, entries: &entries) { element in
+            .variable(element)
+        }
+        index += 1
+
+        emitArraySeqMinMaxCoverageTest(index: index, useMax: false, lines: &lines, entries: &entries) { element in
+            .variable(element)
+        }
+        index += 1
+
+        emitArraySeqMinMaxCoverageTest(index: index, useMax: true, lines: &lines, entries: &entries) { element in
+            .variable(element)
+        }
+        index += 1
+
+        emitArrayForCoverageTest(index: index, lines: &lines, entries: &entries) { element in
+            .op("+", .variable(element), .constant("Float(1.0)"))
+        }
+        index += 1
+
+        emitPairArrayMapReduceCoverageTest(index: index, lines: &lines, entries: &entries) { va, vb in
+            .op("+", .variable(va), .variable(vb))
+        }
+        index += 1
+
+        emitOptionalCoverageTest(index: index, lines: &lines, entries: &entries) { element in
+            .abs(.variable(element))
+        }
+        index += 1
+
+        emitArrayUpdateCoverageTest(index: index, lines: &lines, entries: &entries) { element in
+            .max(.variable(element), .constant("Float(0.5)"))
+        }
+        index += 1
+
+        emitDictUpdateCoverageTest(index: index, lines: &lines, entries: &entries) { element in
+            .atan2(.variable(element), .constant("Float(0.25)"))
+        }
+        index += 1
+
+        return index
+    }
+
+    private func emitScalarCoverageTest(index: Int, lines: inout [String], entries: inout [String], nodeFactory: (String) -> ScalarNode) {
+        let input = emitFloatScalar(name: "x\(index)", lines: &lines)
+        let fn = "testFunc\(index)"
+        let node = nodeFactory(input)
+        let emitted = emitScalarNode(node)
+        lines.append("@differentiable(reverse)")
+        lines.append("private func \(fn)(x: Float) -> Float {")
+        for line in emitted.lines {
+            lines.append("    \(line)")
+        }
+        lines.append("    return \(emitted.result)")
+        lines.append("}")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"\(describe(node))\", iterations: 200, input: .scalarFloat(\(input)), forward: { sink(\(fn)(x: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
+        lines.append("")
+    }
+
+    private func emitRunWithoutDerivativeCoverageTest(index: Int, lines: inout [String], entries: inout [String]) {
+        let input = emitFloatScalar(name: "x\(index)", lines: &lines)
+        let fn = "testFunc\(index)"
+        lines.append("@differentiable(reverse)")
+        lines.append("private func \(fn)(x: Float) -> Float {")
+        lines.append("    let y = withoutDerivative(at: x)")
+        lines.append("    return y + x")
+        lines.append("}")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"runWithoutDerivative + var + var\", iterations: 200, input: .scalarFloat(\(input)), forward: { sink(\(fn)(x: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
+        lines.append("")
+    }
+
+    private func emitArrayMapReduceCoverageTest(index: Int, lines: inout [String], entries: inout [String], nodeFactory: (String) -> ScalarNode) {
+        let input = emitFloatArray(name: "input\(index)", lines: &lines)
+        let fn = "testFunc\(index)"
+        let element = "v\(index)"
+        let node = nodeFactory(element)
+        let emitted = emitScalarNode(node)
+        lines.append("@differentiable(reverse)")
+        lines.append("private func \(fn)(values: [Float]) -> Float {")
+        lines.append("    return values.differentiableMap { \(element) in")
+        for line in emitted.lines {
+            lines.append("        \(line)")
+        }
+        lines.append("        return \(emitted.result)")
+        lines.append("    }.differentiableReduce(Float.zero, +)")
+        lines.append("}")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"array + map + reduce + \(describe(node))\", iterations: 200, input: .singleFloat(\(input)), forward: { sink(\(fn)(values: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
+        lines.append("")
+    }
+
+    private func emitArraySeqMinMaxCoverageTest(index: Int, useMax: Bool, lines: inout [String], entries: inout [String], nodeFactory: (String) -> ScalarNode) {
+        let input = emitFloatArray(name: "input\(index)", lines: &lines)
+        let fn = "testFunc\(index)"
+        let element = "v\(index)"
+        let node = nodeFactory(element)
+        let emitted = emitScalarNode(node)
+        let op = useMax ? "max" : "min"
+        lines.append("@differentiable(reverse)")
+        lines.append("private func \(fn)(values: [Float]) -> Float {")
+        lines.append("    let mapped = values.differentiableMap { \(element) in")
+        for line in emitted.lines {
+            lines.append("        \(line)")
+        }
+        lines.append("        return \(emitted.result)")
+        lines.append("    }")
+        lines.append("    return mapped.\(op)()!")
+        lines.append("}")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"array + map + seq\(useMax ? "Max" : "Min") + \(describe(node))\", iterations: 200, input: .singleFloat(\(input)), forward: { sink(\(fn)(values: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
+        lines.append("")
+    }
+
+    private func emitArrayForCoverageTest(index: Int, lines: inout [String], entries: inout [String], nodeFactory: (String) -> ScalarNode) {
+        let input = emitFloatArray(name: "input\(index)", lines: &lines)
+        let fn = "testFunc\(index)"
+        let element = "v\(index)"
+        let node = nodeFactory(element)
+        let emitted = emitScalarNode(node)
+        lines.append("@differentiable(reverse)")
+        lines.append("private func \(fn)(values: [Float]) -> Float {")
+        lines.append("    var sum: Float = 0")
+        lines.append("    for i in 0 ..< withoutDerivative(at: values.count) {")
+        lines.append("        let \(element) = values[i]")
+        for line in emitted.lines {
+            lines.append("        \(line)")
+        }
+        lines.append("        sum += \(emitted.result)")
+        lines.append("    }")
+        lines.append("    return sum")
+        lines.append("}")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"array + for + \(describe(node))\", iterations: 200, input: .singleFloat(\(input)), forward: { sink(\(fn)(values: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
+        lines.append("")
+    }
+
+    private func emitPairArrayMapReduceCoverageTest(index: Int, lines: inout [String], entries: inout [String], nodeFactory: (String, String) -> ScalarNode) {
+        let a = emitFloatArray(name: "input\(index)A", lines: &lines)
+        let b = emitFloatArray(name: "input\(index)B", lines: &lines)
+        let fn = "testFunc\(index)"
+        let va = "a\(index)"
+        let vb = "b\(index)"
+        let node = nodeFactory(va, vb)
+        let emitted = emitScalarNode(node)
+        lines.append("@differentiable(reverse)")
+        lines.append("private func \(fn)(a: [Float], b: [Float]) -> Float {")
+        lines.append("    return differentiableZip(a, b).differentiableMap { \(va), \(vb) in")
+        for line in emitted.lines {
+            lines.append("        \(line)")
+        }
+        lines.append("        return \(emitted.result)")
+        lines.append("    }.differentiableReduce(Float.zero, +)")
+        lines.append("}")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"zip + map + \(describe(node))\", iterations: 200, input: .pairFloat(\(a), \(b)), forward: { sink(\(fn)(a: \(a), b: \(b))) }, reverse: { sink(pullback(at: \(a), \(b), of: \(fn))(1)) })")
+        lines.append("")
+    }
+
+    private func emitOptionalCoverageTest(index: Int, lines: inout [String], entries: inout [String], nodeFactory: (String) -> ScalarNode) {
+        let input = emitFloatScalar(name: "x\(index)", lines: &lines)
+        let fn = "testFunc\(index)"
+        let element = "v\(index)"
+        let node = nodeFactory(element)
+        let emitted = emitScalarNode(node)
+        lines.append("@differentiable(reverse)")
+        lines.append("private func \(fn)(x: Float) -> Float {")
+        lines.append("    let opt: Float? = x")
+        lines.append("    return opt.differentiableMap { \(element) in")
+        for line in emitted.lines {
+            lines.append("        \(line)")
+        }
+        lines.append("        return \(emitted.result)")
+        lines.append("    }!")
+        lines.append("}")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"optional + map + \(describe(node))\", iterations: 200, input: .scalarFloat(\(input)), forward: { sink(\(fn)(x: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
+        lines.append("")
+    }
+
+    private func emitArrayUpdateCoverageTest(index: Int, lines: inout [String], entries: inout [String], nodeFactory: (String) -> ScalarNode) {
+        let input = emitFloatArray(name: "input\(index)", lines: &lines)
+        let fn = "testFunc\(index)"
+        let current = "c\(index)"
+        let node = nodeFactory(current)
+        let emitted = emitScalarNode(node)
+        lines.append("@differentiable(reverse)")
+        lines.append("private func \(fn)(values: [Float]) -> Float {")
+        lines.append("    var out = values")
+        lines.append("    let idx = withoutDerivative(at: values.count / 2)")
+        lines.append("    let \(current) = out[idx]")
+        for line in emitted.lines {
+            lines.append("    \(line)")
+        }
+        lines.append("    out.update(at: idx, with: \(emitted.result))")
+        lines.append("    return out.differentiableReduce(Float.zero, +)")
+        lines.append("}")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"array + update + \(describe(node))\", iterations: 200, input: .singleFloat(\(input)), forward: { sink(\(fn)(values: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
+        lines.append("")
+    }
+
+    private func emitDictUpdateCoverageTest(index: Int, lines: inout [String], entries: inout [String], nodeFactory: (String) -> ScalarNode) {
+        let input = emitFloatDictionary(name: "dict\(index)", lines: &lines)
+        let fn = "testFunc\(index)"
+        let current = "d\(index)"
+        let node = nodeFactory(current)
+        let emitted = emitScalarNode(node)
+        lines.append("@differentiable(reverse)")
+        lines.append("private func \(fn)(dict: [Int: Float]) -> Float {")
+        lines.append("    var out = dict")
+        lines.append("    let key = withoutDerivative(at: 0)")
+        lines.append("    let \(current) = out[key]!")
+        for line in emitted.lines {
+            lines.append("    \(line)")
+        }
+        lines.append("    out.update(at: key, with: \(emitted.result))")
+        lines.append("    return out[key]!")
+        lines.append("}")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"dict + update + \(describe(node))\", iterations: 200, input: .dictIntFloat(\(input)), forward: { sink(\(fn)(dict: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
+        lines.append("")
     }
 
     private func emitScalarTest(index: Int, lines: inout [String], entries: inout [String]) {
@@ -1273,7 +1960,7 @@ final class SwiftSourceGenerator {
             lines.append("    \(line)")
         }
         lines.append("    out.update(at: key, with: \(emitted.result))")
-        lines.append("    return out[key] ?? 0")
+        lines.append("    return out[key]!")
         lines.append("}")
         entries.append("GeneratedTestCase(index: \(index), snippet: \"dict + update + \(describe(node))\", iterations: 200, input: .dictIntFloat(\(input)), forward: { sink(\(fn)(dict: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
         lines.append("")
@@ -1450,7 +2137,7 @@ final class SwiftSourceGenerator {
             let ex = emitScalarNode(x, tempIndex: &tempIndex)
             let name = "t\(tempIndex)"
             tempIndex += 1
-            return EmittedScalar(lines: ey.lines + ex.lines + ["let \(name) = atan2(\(ey.result), \(ex.result))"], result: name)
+            return EmittedScalar(lines: ey.lines + ex.lines + ["let \(name) = atan2d(\(ey.result), \(ex.result))"], result: name)
         case .cond(let c, let t, let f):
             let ec = emitScalarNode(c, tempIndex: &tempIndex)
             let et = emitScalarNode(t, tempIndex: &tempIndex)

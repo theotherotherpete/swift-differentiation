@@ -26,6 +26,10 @@ Also include these differentiable operators/APIs from the repo where type-compat
 - `InlineArray` `read`, `update`, `+`, `-` (Swift 6.2+, macOS/iOS 26 only)
 - `runWithoutDerivative` (as a control / nonvarying baseline)
 
+Coverage requirements:
+- Every fundamental operator must be tested at least once as a standalone baseline (as with `min`, `max`, `abs`).
+- Every operator in the palette must appear at least once in combination with at least one other operator in the same run.
+
 Generate ordered combinations containing up to **`--depth` operators/constructs** (default 3) working together (e.g. `map` + `*` + `zip`, or `for` + `if` + `+`). Order matters (`if + map` is distinct from `map + if`). `--depth N` creates test cases using between 1 and `N` nested operators and errors if `N < 1`.
 
 Focus on **obviously composable** operators and types:
