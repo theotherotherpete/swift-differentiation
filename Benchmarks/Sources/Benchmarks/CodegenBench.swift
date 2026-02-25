@@ -197,6 +197,21 @@ enum CodegenBench {
     }
 }
 
+// MARK: - Result sink (prevent DCE)
+
+@inline(never)
+func sink(_ value: Float) {
+    Blackhole.consume(value)
+}
+
+enum Blackhole {
+    private static var storage: Float = 0
+
+    static func consume(_ value: Float) {
+        storage = storage &+ value
+    }
+}
+
 // MARK: - Seed
 
 struct Seed {
@@ -307,72 +322,72 @@ private func baselineTests(seed: Seed, size: Int) -> [GeneratedTestCase] {
             snippet: "baseline:+",
             iterations: 400,
             input: .scalarFloat(x),
-            forward: { _ = baselineAdd(x) },
-            reverse: { _ = pullback(at: x, of: baselineAdd)(1) }
+            forward: { sink(baselineAdd(x)) },
+            reverse: { sink(pullback(at: x, of: baselineAdd)(1)) }
         ),
         GeneratedTestCase(
             index: -2,
             snippet: "baseline:-",
             iterations: 400,
             input: .scalarFloat(x),
-            forward: { _ = baselineSub(x) },
-            reverse: { _ = pullback(at: x, of: baselineSub)(1) }
+            forward: { sink(baselineSub(x)) },
+            reverse: { sink(pullback(at: x, of: baselineSub)(1)) }
         ),
         GeneratedTestCase(
             index: -3,
             snippet: "baseline:*",
             iterations: 400,
             input: .scalarFloat(x),
-            forward: { _ = baselineMul(x) },
-            reverse: { _ = pullback(at: x, of: baselineMul)(1) }
+            forward: { sink(baselineMul(x)) },
+            reverse: { sink(pullback(at: x, of: baselineMul)(1)) }
         ),
         GeneratedTestCase(
             index: -4,
             snippet: "baseline:/",
             iterations: 400,
             input: .scalarFloat(x),
-            forward: { _ = baselineDiv(x) },
-            reverse: { _ = pullback(at: x, of: baselineDiv)(1) }
+            forward: { sink(baselineDiv(x)) },
+            reverse: { sink(pullback(at: x, of: baselineDiv)(1)) }
         ),
         GeneratedTestCase(
             index: -5,
             snippet: "baseline:abs",
             iterations: 400,
             input: .scalarFloat(x),
-            forward: { _ = baselineAbs(x) },
-            reverse: { _ = pullback(at: x, of: baselineAbs)(1) }
+            forward: { sink(baselineAbs(x)) },
+            reverse: { sink(pullback(at: x, of: baselineAbs)(1)) }
         ),
         GeneratedTestCase(
             index: -6,
             snippet: "baseline:min",
             iterations: 400,
             input: .scalarFloat(x),
-            forward: { _ = baselineMin(x) },
-            reverse: { _ = pullback(at: x, of: baselineMin)(1) }
+            forward: { sink(baselineMin(x)) },
+            reverse: { sink(pullback(at: x, of: baselineMin)(1)) }
         ),
         GeneratedTestCase(
             index: -7,
             snippet: "baseline:max",
             iterations: 400,
             input: .scalarFloat(x),
-            forward: { _ = baselineMax(x) },
-            reverse: { _ = pullback(at: x, of: baselineMax)(1) }
+            forward: { sink(baselineMax(x)) },
+            reverse: { sink(pullback(at: x, of: baselineMax)(1)) }
         ),
         GeneratedTestCase(
             index: -8,
             snippet: "baseline:map+reduce",
             iterations: 200,
             input: .singleFloat(values),
-            forward: { _ = baselineMapReduce(values) },
-            reverse: { _ = pullback(at: values, of: baselineMapReduce)(1) }
+            forward: { sink(baselineMapReduce(values)) },
+            reverse: { sink(pullback(at: values, of: baselineMapReduce)(1)) }
         ),
         GeneratedTestCase(
             index: -9,
             snippet: "baseline:zip+map+reduce",
             iterations: 200,
             input: .pairFloat(a, b),
-            forward: { _ = baselineZipMapReduce(a, b) },
-            reverse: { _ = pullback(at: a, b, of: baselineZipMapReduce)(1) }
+            forward: { sink(baselineZipMapReduce(a, b)) },
+            reverse: { sink(pullback(at: a, b, of: baselineZipMapReduce)(1)) }
         ),
     ]
 }
@@ -559,6 +574,106 @@ final class TestGenerator {
         }
     }
 
+    private func containsVariable(_ node: ScalarNode) -> Bool {
+        switch node {
+        case .variable:
+            return true
+        case .constant:
+            return false
+        case .abs(let n):
+            return containsVariable(n)
+        case .min(let a, let b), .max(let a, let b), .op(_, let a, let b):
+            return containsVariable(a) || containsVariable(b)
+        case .cond(let c, let t, let f):
+            return containsVariable(c) || containsVariable(t) || containsVariable(f)
+        }
+    }
+
+    private func ensureVariable(_ node: ScalarNode, vars: [ScalarVar]) -> ScalarNode {
+        guard !vars.isEmpty else { return node }
+        guard !containsVariable(node) else { return node }
+        return replaceConstant(node, with: vars[0]) ?? .variable(vars[0])
+    }
+
+    private func replaceConstant(_ node: ScalarNode, with variable: ScalarVar) -> ScalarNode? {
+        switch node {
+        case .variable:
+            return nil
+        case .constant:
+            return .variable(variable)
+        case .abs(let n):
+            guard let replaced = replaceConstant(n, with: variable) else { return nil }
+            return .abs(replaced)
+        case .min(let a, let b):
+            if let replaced = replaceConstant(a, with: variable) { return .min(replaced, b) }
+            if let replaced = replaceConstant(b, with: variable) { return .min(a, replaced) }
+            return nil
+        case .max(let a, let b):
+            if let replaced = replaceConstant(a, with: variable) { return .max(replaced, b) }
+            if let replaced = replaceConstant(b, with: variable) { return .max(a, replaced) }
+            return nil
+        case .op(let op, let a, let b):
+            if let replaced = replaceConstant(a, with: variable) { return .op(op, replaced, b) }
+            if let replaced = replaceConstant(b, with: variable) { return .op(op, a, replaced) }
+            return nil
+        case .cond(let c, let t, let f):
+            if let replaced = replaceConstant(c, with: variable) { return .cond(replaced, t, f) }
+            if let replaced = replaceConstant(t, with: variable) { return .cond(c, replaced, f) }
+            if let replaced = replaceConstant(f, with: variable) { return .cond(c, t, replaced) }
+            return nil
+        }
+    }
+
+    private func containsVariable(_ node: ScalarNode) -> Bool {
+        switch node {
+        case .variable:
+            return true
+        case .constant:
+            return false
+        case .abs(let n):
+            return containsVariable(n)
+        case .min(let a, let b), .max(let a, let b), .op(_, let a, let b):
+            return containsVariable(a) || containsVariable(b)
+        case .cond(let c, let t, let f):
+            return containsVariable(c) || containsVariable(t) || containsVariable(f)
+        }
+    }
+
+    private func ensureVariable(_ node: ScalarNode, vars: [String]) -> ScalarNode {
+        guard !vars.isEmpty else { return node }
+        guard !containsVariable(node) else { return node }
+        return replaceConstant(node, with: vars[0]) ?? .variable(vars[0])
+    }
+
+    private func replaceConstant(_ node: ScalarNode, with variable: String) -> ScalarNode? {
+        switch node {
+        case .variable:
+            return nil
+        case .constant:
+            return .variable(variable)
+        case .abs(let n):
+            guard let replaced = replaceConstant(n, with: variable) else { return nil }
+            return .abs(replaced)
+        case .min(let a, let b):
+            if let replaced = replaceConstant(a, with: variable) { return .min(replaced, b) }
+            if let replaced = replaceConstant(b, with: variable) { return .min(a, replaced) }
+            return nil
+        case .max(let a, let b):
+            if let replaced = replaceConstant(a, with: variable) { return .max(replaced, b) }
+            if let replaced = replaceConstant(b, with: variable) { return .max(a, replaced) }
+            return nil
+        case .op(let op, let a, let b):
+            if let replaced = replaceConstant(a, with: variable) { return .op(op, replaced, b) }
+            if let replaced = replaceConstant(b, with: variable) { return .op(op, a, replaced) }
+            return nil
+        case .cond(let c, let t, let f):
+            if let replaced = replaceConstant(c, with: variable) { return .cond(replaced, t, f) }
+            if let replaced = replaceConstant(t, with: variable) { return .cond(c, replaced, f) }
+            if let replaced = replaceConstant(f, with: variable) { return .cond(c, t, replaced) }
+            return nil
+        }
+    }
+
     private func randomOpsTarget() -> Int {
         return randomOpsTarget(minimum: 1)
     }
@@ -591,7 +706,7 @@ final class TestGenerator {
 
     private func makeScalarTest(index: Int) -> GeneratedTestCase {
         let input = Float(rng.nextDouble(in: -10.0, 10.0))
-        let node = randomScalarNode(vars: [.x], ops: randomOpsTarget())
+        let node = ensureVariable(randomScalarNode(vars: [.x], ops: randomOpsTarget()), vars: [.x])
         let snippet = describe(node)
         @differentiable(reverse)
         func test(x: Float) -> Float {
@@ -603,8 +718,8 @@ final class TestGenerator {
             snippet: snippet,
             iterations: 200,
             input: .scalarFloat(input),
-            forward: { _ = test(x: input) },
-            reverse: { _ = pullback(at: input, of: test)(1) }
+            forward: { sink(test(x: input)) },
+            reverse: { sink(pullback(at: input, of: test)(1)) }
         )
     }
 
@@ -615,7 +730,7 @@ final class TestGenerator {
         let arrayOps = useMapReduce ? 2 : 1
         let remaining = max(0, totalOps - arrayOps)
         let scalarOps = remaining == 0 ? 0 : Int(rng.next() % UInt64(remaining + 1))
-        let node = randomScalarNode(vars: [.x], ops: scalarOps)
+        let node = ensureVariable(randomScalarNode(vars: [.x], ops: scalarOps), vars: [.x])
         let snippet = useMapReduce ? "array + map + reduce + \(describe(node))" : "array + for + \(describe(node))"
         if useMapReduce {
             @differentiable(reverse)
@@ -630,8 +745,8 @@ final class TestGenerator {
                 snippet: snippet,
                 iterations: 200,
                 input: .singleFloat(input),
-                forward: { _ = test(values: input) },
-                reverse: { _ = pullback(at: input, of: test)(1) }
+                forward: { sink(test(values: input)) },
+                reverse: { sink(pullback(at: input, of: test)(1)) }
             )
         }
         @differentiable(reverse)
@@ -649,8 +764,8 @@ final class TestGenerator {
             snippet: snippet,
             iterations: 200,
             input: .singleFloat(input),
-            forward: { _ = test(values: input) },
-            reverse: { _ = pullback(at: input, of: test)(1) }
+            forward: { sink(test(values: input)) },
+            reverse: { sink(pullback(at: input, of: test)(1)) }
         )
     }
 
@@ -662,7 +777,7 @@ final class TestGenerator {
         let arrayOps = useMapReduce ? 3 : 2
         let remaining = max(0, totalOps - arrayOps)
         let scalarOps = remaining == 0 ? 0 : Int(rng.next() % UInt64(remaining + 1))
-        let node = randomScalarNode(vars: [.a, .b], ops: scalarOps)
+        let node = ensureVariable(randomScalarNode(vars: [.a, .b], ops: scalarOps), vars: [.a, .b])
         let snippet = useMapReduce ? "zip + map + \(describe(node))" : "zip + for + \(describe(node))"
         if useMapReduce {
             @differentiable(reverse)
@@ -677,8 +792,8 @@ final class TestGenerator {
                 snippet: snippet,
                 iterations: 200,
                 input: .pairFloat(a, b),
-                forward: { _ = test(a: a, b: b) },
-                reverse: { _ = pullback(at: a, b, of: test)(1) }
+                forward: { sink(test(a: a, b: b)) },
+                reverse: { sink(pullback(at: a, b, of: test)(1)) }
             )
         }
         @differentiable(reverse)
@@ -698,8 +813,8 @@ final class TestGenerator {
             snippet: snippet,
             iterations: 200,
             input: .pairFloat(a, b),
-            forward: { _ = test(a: a, b: b) },
-            reverse: { _ = pullback(at: a, b, of: test)(1) }
+            forward: { sink(test(a: a, b: b)) },
+            reverse: { sink(pullback(at: a, b, of: test)(1)) }
         )
     }
 
@@ -929,7 +1044,7 @@ final class SwiftSourceGenerator {
     private func emitScalarTest(index: Int, lines: inout [String], entries: inout [String]) {
         let input = emitFloatScalar(name: "x\(index)", lines: &lines)
         let fn = "testFunc\(index)"
-        let node = randomScalarNode(vars: [input], ops: randomOpsTarget())
+        let node = ensureVariable(randomScalarNode(vars: [input], ops: randomOpsTarget()), vars: [input])
         let emitted = emitScalarNode(node)
         lines.append("@differentiable(reverse)")
         lines.append("private func \(fn)(x: Float) -> Float {")
@@ -938,7 +1053,7 @@ final class SwiftSourceGenerator {
         }
         lines.append("    return \(emitted.result)")
         lines.append("}")
-        entries.append("GeneratedTestCase(index: \(index), snippet: \"\(describe(node))\", iterations: 200, input: .scalarFloat(\(input)), forward: { _ = \(fn)(x: \(input)) }, reverse: { _ = pullback(at: \(input), of: \(fn))(1) })")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"\(describe(node))\", iterations: 200, input: .scalarFloat(\(input)), forward: { sink(\(fn)(x: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
         lines.append("")
     }
 
@@ -953,7 +1068,7 @@ final class SwiftSourceGenerator {
             lines.append("    \(line)")
         }
         lines.append("}")
-        entries.append("GeneratedTestCase(index: \(index), snippet: \"array + \(expr.snippet)\", iterations: 200, input: .singleFloat(\(input)), forward: { _ = \(fn)(values: \(input)) }, reverse: { _ = pullback(at: \(input), of: \(fn))(1) })")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"array + \(expr.snippet)\", iterations: 200, input: .singleFloat(\(input)), forward: { sink(\(fn)(values: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
         lines.append("")
     }
 
@@ -970,7 +1085,7 @@ final class SwiftSourceGenerator {
             lines.append("    \(line)")
         }
         lines.append("}")
-        entries.append("GeneratedTestCase(index: \(index), snippet: \"zip + map + \(expr.snippet)\", iterations: 200, input: .pairFloat(\(a), \(b)), forward: { _ = \(fn)(a: \(a), b: \(b)) }, reverse: { _ = pullback(at: \(a), \(b), of: \(fn))(1) })")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"zip + map + \(expr.snippet)\", iterations: 200, input: .pairFloat(\(a), \(b)), forward: { sink(\(fn)(a: \(a), b: \(b))) }, reverse: { sink(pullback(at: \(a), \(b), of: \(fn))(1)) })")
         lines.append("")
     }
 
@@ -1116,7 +1231,7 @@ final class SwiftSourceGenerator {
         let arrayOps = useMapReduce ? 2 : 1
         let remaining = max(0, totalOps - arrayOps)
         let scalarOps = remaining == 0 ? 0 : Int(rng.next() % UInt64(remaining + 1))
-        let scalarNode = randomScalarNode(vars: [elementName], ops: scalarOps)
+        let scalarNode = ensureVariable(randomScalarNode(vars: [elementName], ops: scalarOps), vars: [elementName])
         let emitted = emitScalarNode(scalarNode)
         if useMapReduce {
             return ArrayExpr(
@@ -1148,7 +1263,7 @@ final class SwiftSourceGenerator {
         let arrayOps = useMapReduce ? 3 : 2
         let remaining = max(0, totalOps - arrayOps)
         let scalarOps = remaining == 0 ? 0 : Int(rng.next() % UInt64(remaining + 1))
-        let scalarNode = randomScalarNode(vars: [va, vb], ops: scalarOps)
+        let scalarNode = ensureVariable(randomScalarNode(vars: [va, vb], ops: scalarOps), vars: [va, vb])
         let emitted = emitScalarNode(scalarNode)
         if useMapReduce {
             return ArrayExpr(
