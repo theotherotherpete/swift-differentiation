@@ -204,11 +204,51 @@ func sink(_ value: Float) {
     Blackhole.consume(value)
 }
 
+@inline(never)
+func sink(_ value: [Float]) {
+    Blackhole.consume(value.reduce(0, +))
+}
+
+@inline(never)
+func sink(_ value: Array<Float>.TangentVector) {
+    sink(Array(value))
+}
+
+@inline(never)
+func sink(_ value: [Int: Float]) {
+    Blackhole.consume(value.values.reduce(0, +))
+}
+
+@inline(never)
+func sink(_ value: (Array<Float>, Array<Float>)) {
+    Blackhole.consume(value.0.reduce(0, +) + value.1.reduce(0, +))
+}
+
+@inline(never)
+func sink(_ value: (Array<Float>.TangentVector, Array<Float>.TangentVector)) {
+    Blackhole.consume(Array(value.0).reduce(0, +) + Array(value.1).reduce(0, +))
+}
+
+@inline(never)
+func sink(_ value: Float?) {
+    Blackhole.consume(value ?? 0)
+}
+
+@inline(never)
+func atan2f(_ y: Float, _ x: Float) -> Float {
+#if canImport(Darwin)
+    return Float(Darwin.atan2(Double(y), Double(x)))
+#else
+    return Float(Glibc.atan2(Double(y), Double(x)))
+#endif
+}
+
+@preconcurrency
 enum Blackhole {
-    private static var storage: Float = 0
+    nonisolated(unsafe) private static var storage: Float = 0
 
     static func consume(_ value: Float) {
-        storage = storage &+ value
+        storage = storage + value
     }
 }
 
@@ -422,10 +462,10 @@ final class TestGenerator {
     func makeTest(index: Int) -> GeneratedTestCase {
         let kinds: [Int]
         if maxDepth < 2 {
-            kinds = [0, 1]
+            kinds = [0, 1, 3, 4]
         }
         else {
-            kinds = [0, 1, 2]
+            kinds = [0, 1, 2, 3, 4, 5]
         }
         let kind = kinds[Int(rng.next() % UInt64(kinds.count))]
         switch kind {
@@ -434,7 +474,16 @@ final class TestGenerator {
         case 1:
             return makeArrayTest(index: index)
         default:
-            return makePairArrayTest(index: index)
+            if kind == 2 {
+                return makePairArrayTest(index: index)
+            }
+            if kind == 3 {
+                return makeOptionalTest(index: index)
+            }
+            if kind == 4 {
+                return makeArrayUpdateTest(index: index)
+            }
+            return makeDictUpdateTest(index: index)
         }
     }
 
@@ -466,6 +515,15 @@ final class TestGenerator {
         return randomDoubleArray(count: size)
     }
 
+    private func makeInputDictionary() -> [Int: Float] {
+        var result: [Int: Float] = [:]
+        result.reserveCapacity(size)
+        for i in 0 ..< size {
+            result[i] = Float(rng.nextDouble(in: -10.0, 10.0))
+        }
+        return result
+    }
+
     private enum ScalarVar {
         case x
         case a
@@ -479,6 +537,7 @@ final class TestGenerator {
         case min(ScalarNode, ScalarNode)
         case max(ScalarNode, ScalarNode)
         case op(String, ScalarNode, ScalarNode)
+        case atan2(ScalarNode, ScalarNode)
         case cond(ScalarNode, ScalarNode, ScalarNode)
 
         @differentiable(reverse, wrt: (xVal, aVal, bVal))
@@ -507,6 +566,8 @@ final class TestGenerator {
                 case "*": return av * bv
                 default: return av / bv
                 }
+            case .atan2(let y, let x):
+                return atan2f(y.eval(xVal: xVal, aVal: aVal, bVal: bVal), x.eval(xVal: xVal, aVal: aVal, bVal: bVal))
             case .cond(let c, let t, let f):
                 return c.eval(xVal: xVal, aVal: aVal, bVal: bVal) > 0
                     ? t.eval(xVal: xVal, aVal: aVal, bVal: bVal)
@@ -524,7 +585,7 @@ final class TestGenerator {
             let value = Float(rng.nextDouble(in: -2.0, 2.0))
             return .constant(value)
         }
-        let choice = Int(rng.next() % 5)
+        let choice = Int(rng.next() % 6)
         let remaining = ops - 1
         switch choice {
         case 0:
@@ -546,6 +607,11 @@ final class TestGenerator {
             let a = randomScalarNode(vars: vars, ops: split[0])
             let b = randomScalarNode(vars: vars, ops: split[1])
             return .max(a, b)
+        case 4:
+            let split = splitOps(remaining, parts: 2)
+            let y = randomScalarNode(vars: vars, ops: split[0])
+            let x = randomScalarNode(vars: vars, ops: split[1])
+            return .atan2(y, x)
         default:
             let split = splitOps(remaining, parts: 3)
             let c = randomScalarNode(vars: vars, ops: split[0])
@@ -569,6 +635,8 @@ final class TestGenerator {
             return "max + \(describe(a)) + \(describe(b))"
         case .op(let op, let a, let b):
             return "\(describe(a)) \(op) \(describe(b))"
+        case .atan2(let y, let x):
+            return "atan2 + \(describe(y)) + \(describe(x))"
         case .cond(let c, let t, let f):
             return "if + \(describe(c)) + \(describe(t)) + \(describe(f))"
         }
@@ -582,7 +650,7 @@ final class TestGenerator {
             return false
         case .abs(let n):
             return containsVariable(n)
-        case .min(let a, let b), .max(let a, let b), .op(_, let a, let b):
+        case .min(let a, let b), .max(let a, let b), .op(_, let a, let b), .atan2(let a, let b):
             return containsVariable(a) || containsVariable(b)
         case .cond(let c, let t, let f):
             return containsVariable(c) || containsVariable(t) || containsVariable(f)
@@ -616,55 +684,9 @@ final class TestGenerator {
             if let replaced = replaceConstant(a, with: variable) { return .op(op, replaced, b) }
             if let replaced = replaceConstant(b, with: variable) { return .op(op, a, replaced) }
             return nil
-        case .cond(let c, let t, let f):
-            if let replaced = replaceConstant(c, with: variable) { return .cond(replaced, t, f) }
-            if let replaced = replaceConstant(t, with: variable) { return .cond(c, replaced, f) }
-            if let replaced = replaceConstant(f, with: variable) { return .cond(c, t, replaced) }
-            return nil
-        }
-    }
-
-    private func containsVariable(_ node: ScalarNode) -> Bool {
-        switch node {
-        case .variable:
-            return true
-        case .constant:
-            return false
-        case .abs(let n):
-            return containsVariable(n)
-        case .min(let a, let b), .max(let a, let b), .op(_, let a, let b):
-            return containsVariable(a) || containsVariable(b)
-        case .cond(let c, let t, let f):
-            return containsVariable(c) || containsVariable(t) || containsVariable(f)
-        }
-    }
-
-    private func ensureVariable(_ node: ScalarNode, vars: [String]) -> ScalarNode {
-        guard !vars.isEmpty else { return node }
-        guard !containsVariable(node) else { return node }
-        return replaceConstant(node, with: vars[0]) ?? .variable(vars[0])
-    }
-
-    private func replaceConstant(_ node: ScalarNode, with variable: String) -> ScalarNode? {
-        switch node {
-        case .variable:
-            return nil
-        case .constant:
-            return .variable(variable)
-        case .abs(let n):
-            guard let replaced = replaceConstant(n, with: variable) else { return nil }
-            return .abs(replaced)
-        case .min(let a, let b):
-            if let replaced = replaceConstant(a, with: variable) { return .min(replaced, b) }
-            if let replaced = replaceConstant(b, with: variable) { return .min(a, replaced) }
-            return nil
-        case .max(let a, let b):
-            if let replaced = replaceConstant(a, with: variable) { return .max(replaced, b) }
-            if let replaced = replaceConstant(b, with: variable) { return .max(a, replaced) }
-            return nil
-        case .op(let op, let a, let b):
-            if let replaced = replaceConstant(a, with: variable) { return .op(op, replaced, b) }
-            if let replaced = replaceConstant(b, with: variable) { return .op(op, a, replaced) }
+        case .atan2(let y, let x):
+            if let replaced = replaceConstant(y, with: variable) { return .atan2(replaced, x) }
+            if let replaced = replaceConstant(x, with: variable) { return .atan2(y, replaced) }
             return nil
         case .cond(let c, let t, let f):
             if let replaced = replaceConstant(c, with: variable) { return .cond(replaced, t, f) }
@@ -726,12 +748,24 @@ final class TestGenerator {
     private func makeArrayTest(index: Int) -> GeneratedTestCase {
         let input = makeInputArray()
         let totalOps = randomOpsTarget()
-        let useMapReduce: Bool = totalOps <= 1 ? false : (Int(rng.next() % 2) == 0)
-        let arrayOps = useMapReduce ? 2 : 1
+        let choiceCount = totalOps <= 1 ? 1 : 3
+        let choice = Int(rng.next() % UInt64(choiceCount))
+        let useMapReduce = choice == 0 && totalOps >= 2
+        let useSeqMinMax = choice == 1 && totalOps >= 2
+        let arrayOps = useMapReduce ? 2 : (useSeqMinMax ? 2 : 1)
         let remaining = max(0, totalOps - arrayOps)
         let scalarOps = remaining == 0 ? 0 : Int(rng.next() % UInt64(remaining + 1))
         let node = ensureVariable(randomScalarNode(vars: [.x], ops: scalarOps), vars: [.x])
-        let snippet = useMapReduce ? "array + map + reduce + \(describe(node))" : "array + for + \(describe(node))"
+        let snippet: String
+        if useMapReduce {
+            snippet = "array + map + reduce + \(describe(node))"
+        }
+        else if useSeqMinMax {
+            snippet = "array + map + seqMinMax + \(describe(node))"
+        }
+        else {
+            snippet = "array + for + \(describe(node))"
+        }
         if useMapReduce {
             @differentiable(reverse)
             func test(values: [Float]) -> Float {
@@ -739,6 +773,25 @@ final class TestGenerator {
                 return values.differentiableMap { v in
                     localNode.eval(xVal: v, aVal: 0, bVal: 0)
                 }.differentiableReduce(Float.zero, +)
+            }
+            return GeneratedTestCase(
+                index: index,
+                snippet: snippet,
+                iterations: 200,
+                input: .singleFloat(input),
+                forward: { sink(test(values: input)) },
+                reverse: { sink(pullback(at: input, of: test)(1)) }
+            )
+        }
+        if useSeqMinMax {
+            let useMax = Int(rng.next() % 2) == 0
+            @differentiable(reverse)
+            func test(values: [Float]) -> Float {
+                let localNode = withoutDerivative(at: node)
+                let mapped = values.differentiableMap { v in
+                    localNode.eval(xVal: v, aVal: 0, bVal: 0)
+                }
+                return useMax ? mapped.max()! : mapped.min()!
             }
             return GeneratedTestCase(
                 index: index,
@@ -765,6 +818,76 @@ final class TestGenerator {
             iterations: 200,
             input: .singleFloat(input),
             forward: { sink(test(values: input)) },
+            reverse: { sink(pullback(at: input, of: test)(1)) }
+        )
+    }
+
+    private func makeOptionalTest(index: Int) -> GeneratedTestCase {
+        let input = Float(rng.nextDouble(in: -10.0, 10.0))
+        let node = ensureVariable(randomScalarNode(vars: [.x], ops: randomOpsTarget()), vars: [.x])
+        let snippet = "optional + map + \(describe(node))"
+        @differentiable(reverse)
+        func test(x: Float) -> Float {
+            let localNode = withoutDerivative(at: node)
+            let opt: Float? = x
+            return opt.differentiableMap { v in
+                localNode.eval(xVal: v, aVal: 0, bVal: 0)
+            }!
+        }
+        return GeneratedTestCase(
+            index: index,
+            snippet: snippet,
+            iterations: 200,
+            input: .scalarFloat(input),
+            forward: { sink(test(x: input)) },
+            reverse: { sink(pullback(at: input, of: test)(1)) }
+        )
+    }
+
+    private func makeArrayUpdateTest(index: Int) -> GeneratedTestCase {
+        let input = makeInputArray()
+        let node = ensureVariable(randomScalarNode(vars: [.x], ops: randomOpsTarget()), vars: [.x])
+        let snippet = "array + update + \(describe(node))"
+        @differentiable(reverse)
+        func test(values: [Float]) -> Float {
+            var out = values
+            let idx = withoutDerivative(at: values.count / 2)
+            let localNode = withoutDerivative(at: node)
+            let current = out[idx]
+            let newValue = localNode.eval(xVal: current, aVal: 0, bVal: 0)
+            out.update(at: idx, with: newValue)
+            return out.differentiableReduce(Float.zero, +)
+        }
+        return GeneratedTestCase(
+            index: index,
+            snippet: snippet,
+            iterations: 200,
+            input: .singleFloat(input),
+            forward: { sink(test(values: input)) },
+            reverse: { sink(pullback(at: input, of: test)(1)) }
+        )
+    }
+
+    private func makeDictUpdateTest(index: Int) -> GeneratedTestCase {
+        let input = makeInputDictionary()
+        let node = ensureVariable(randomScalarNode(vars: [.x], ops: randomOpsTarget()), vars: [.x])
+        let snippet = "dict + update + \(describe(node))"
+        @differentiable(reverse)
+        func test(dict: [Int: Float]) -> Float {
+            var out = dict
+            let key = withoutDerivative(at: 0)
+            let localNode = withoutDerivative(at: node)
+            let current = out[key]!
+            let newValue = localNode.eval(xVal: current, aVal: 0, bVal: 0)
+            out.update(at: key, with: newValue)
+            return out[key]!
+        }
+        return GeneratedTestCase(
+            index: index,
+            snippet: snippet,
+            iterations: 200,
+            input: .dictIntFloat(input),
+            forward: { sink(test(dict: input)) },
             reverse: { sink(pullback(at: input, of: test)(1)) }
         )
     }
@@ -1025,10 +1148,10 @@ final class SwiftSourceGenerator {
     private func emitRandomTest(index: Int, lines: inout [String], entries: inout [String]) {
         let kinds: [Int]
         if maxDepth < 2 {
-            kinds = [0, 1]
+            kinds = [0, 1, 3, 4]
         }
         else {
-            kinds = [0, 1, 2]
+            kinds = [0, 1, 2, 3, 4, 5]
         }
         let kind = kinds[Int(rng.next() % UInt64(kinds.count))]
         switch kind {
@@ -1036,8 +1159,14 @@ final class SwiftSourceGenerator {
             emitScalarTest(index: index, lines: &lines, entries: &entries)
         case 1:
             emitArrayTest(index: index, lines: &lines, entries: &entries)
-        default:
+        case 2:
             emitPairArrayTest(index: index, lines: &lines, entries: &entries)
+        case 3:
+            emitOptionalTest(index: index, lines: &lines, entries: &entries)
+        case 4:
+            emitArrayUpdateTest(index: index, lines: &lines, entries: &entries)
+        default:
+            emitDictUpdateTest(index: index, lines: &lines, entries: &entries)
         }
     }
 
@@ -1089,6 +1218,67 @@ final class SwiftSourceGenerator {
         lines.append("")
     }
 
+    private func emitOptionalTest(index: Int, lines: inout [String], entries: inout [String]) {
+        let input = emitFloatScalar(name: "x\(index)", lines: &lines)
+        let fn = "testFunc\(index)"
+        let node = ensureVariable(randomScalarNode(vars: ["v\(index)"], ops: randomOpsTarget()), vars: ["v\(index)"])
+        let emitted = emitScalarNode(node)
+        lines.append("@differentiable(reverse)")
+        lines.append("private func \(fn)(x: Float) -> Float {")
+        lines.append("    let opt: Float? = x")
+        lines.append("    return opt.differentiableMap { v\(index) in")
+        for line in emitted.lines {
+            lines.append("        \(line)")
+        }
+        lines.append("        return \(emitted.result)")
+        lines.append("    }!")
+        lines.append("}")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"optional + map + \(describe(node))\", iterations: 200, input: .scalarFloat(\(input)), forward: { sink(\(fn)(x: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
+        lines.append("")
+    }
+
+    private func emitArrayUpdateTest(index: Int, lines: inout [String], entries: inout [String]) {
+        let input = emitFloatArray(name: "input\(index)", lines: &lines)
+        let fn = "testFunc\(index)"
+        let current = "c\(index)"
+        let node = ensureVariable(randomScalarNode(vars: [current], ops: randomOpsTarget()), vars: [current])
+        let emitted = emitScalarNode(node)
+        lines.append("@differentiable(reverse)")
+        lines.append("private func \(fn)(values: [Float]) -> Float {")
+        lines.append("    var out = values")
+        lines.append("    let idx = withoutDerivative(at: values.count / 2)")
+        lines.append("    let \(current) = out[idx]")
+        for line in emitted.lines {
+            lines.append("    \(line)")
+        }
+        lines.append("    out.update(at: idx, with: \(emitted.result))")
+        lines.append("    return out.differentiableReduce(Float.zero, +)")
+        lines.append("}")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"array + update + \(describe(node))\", iterations: 200, input: .singleFloat(\(input)), forward: { sink(\(fn)(values: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
+        lines.append("")
+    }
+
+    private func emitDictUpdateTest(index: Int, lines: inout [String], entries: inout [String]) {
+        let input = emitFloatDictionary(name: "dict\(index)", lines: &lines)
+        let fn = "testFunc\(index)"
+        let current = "d\(index)"
+        let node = ensureVariable(randomScalarNode(vars: [current], ops: randomOpsTarget()), vars: [current])
+        let emitted = emitScalarNode(node)
+        lines.append("@differentiable(reverse)")
+        lines.append("private func \(fn)(dict: [Int: Float]) -> Float {")
+        lines.append("    var out = dict")
+        lines.append("    let key = withoutDerivative(at: 0)")
+        lines.append("    let \(current) = out[key]!")
+        for line in emitted.lines {
+            lines.append("    \(line)")
+        }
+        lines.append("    out.update(at: key, with: \(emitted.result))")
+        lines.append("    return out[key] ?? 0")
+        lines.append("}")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"dict + update + \(describe(node))\", iterations: 200, input: .dictIntFloat(\(input)), forward: { sink(\(fn)(dict: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
+        lines.append("")
+    }
+
     private indirect enum ScalarNode {
         case variable(String)
         case constant(String)
@@ -1096,6 +1286,7 @@ final class SwiftSourceGenerator {
         case min(ScalarNode, ScalarNode)
         case max(ScalarNode, ScalarNode)
         case op(String, ScalarNode, ScalarNode)
+        case atan2(ScalarNode, ScalarNode)
         case cond(ScalarNode, ScalarNode, ScalarNode)
     }
 
@@ -1114,7 +1305,7 @@ final class SwiftSourceGenerator {
             let value = String(format: "%.4f", rng.nextDouble(in: -2.0, 2.0))
             return .constant("Float(\(value))")
         }
-        let choice = Int(rng.next() % 5)
+        let choice = Int(rng.next() % 6)
         let remaining = ops - 1
         switch choice {
         case 0:
@@ -1136,6 +1327,11 @@ final class SwiftSourceGenerator {
             let a = randomScalarNode(vars: vars, ops: split[0])
             let b = randomScalarNode(vars: vars, ops: split[1])
             return .max(a, b)
+        case 4:
+            let split = splitOps(remaining, parts: 2)
+            let y = randomScalarNode(vars: vars, ops: split[0])
+            let x = randomScalarNode(vars: vars, ops: split[1])
+            return .atan2(y, x)
         default:
             let split = splitOps(remaining, parts: 3)
             let cond = randomScalarNode(vars: vars, ops: split[0])
@@ -1159,8 +1355,64 @@ final class SwiftSourceGenerator {
             return "max + \(describe(a)) + \(describe(b))"
         case .op(let op, let a, let b):
             return "\(describe(a)) \(op) \(describe(b))"
+        case .atan2(let y, let x):
+            return "atan2 + \(describe(y)) + \(describe(x))"
         case .cond(let c, let t, let f):
             return "if + \(describe(c)) + \(describe(t)) + \(describe(f))"
+        }
+    }
+
+    private func containsVariable(_ node: ScalarNode) -> Bool {
+        switch node {
+        case .variable:
+            return true
+        case .constant:
+            return false
+        case .abs(let n):
+            return containsVariable(n)
+        case .min(let a, let b), .max(let a, let b), .op(_, let a, let b), .atan2(let a, let b):
+            return containsVariable(a) || containsVariable(b)
+        case .cond(let c, let t, let f):
+            return containsVariable(c) || containsVariable(t) || containsVariable(f)
+        }
+    }
+
+    private func ensureVariable(_ node: ScalarNode, vars: [String]) -> ScalarNode {
+        guard !vars.isEmpty else { return node }
+        guard !containsVariable(node) else { return node }
+        return replaceConstant(node, with: vars[0]) ?? .variable(vars[0])
+    }
+
+    private func replaceConstant(_ node: ScalarNode, with variable: String) -> ScalarNode? {
+        switch node {
+        case .variable:
+            return nil
+        case .constant:
+            return .variable(variable)
+        case .abs(let n):
+            guard let replaced = replaceConstant(n, with: variable) else { return nil }
+            return .abs(replaced)
+        case .min(let a, let b):
+            if let replaced = replaceConstant(a, with: variable) { return .min(replaced, b) }
+            if let replaced = replaceConstant(b, with: variable) { return .min(a, replaced) }
+            return nil
+        case .max(let a, let b):
+            if let replaced = replaceConstant(a, with: variable) { return .max(replaced, b) }
+            if let replaced = replaceConstant(b, with: variable) { return .max(a, replaced) }
+            return nil
+        case .op(let op, let a, let b):
+            if let replaced = replaceConstant(a, with: variable) { return .op(op, replaced, b) }
+            if let replaced = replaceConstant(b, with: variable) { return .op(op, a, replaced) }
+            return nil
+        case .atan2(let y, let x):
+            if let replaced = replaceConstant(y, with: variable) { return .atan2(replaced, x) }
+            if let replaced = replaceConstant(x, with: variable) { return .atan2(y, replaced) }
+            return nil
+        case .cond(let c, let t, let f):
+            if let replaced = replaceConstant(c, with: variable) { return .cond(replaced, t, f) }
+            if let replaced = replaceConstant(t, with: variable) { return .cond(c, replaced, f) }
+            if let replaced = replaceConstant(f, with: variable) { return .cond(c, t, replaced) }
+            return nil
         }
     }
 
@@ -1193,6 +1445,12 @@ final class SwiftSourceGenerator {
             let name = "t\(tempIndex)"
             tempIndex += 1
             return EmittedScalar(lines: ea.lines + eb.lines + ["let \(name) = (\(ea.result) \(op) \(eb.result))"], result: name)
+        case .atan2(let y, let x):
+            let ey = emitScalarNode(y, tempIndex: &tempIndex)
+            let ex = emitScalarNode(x, tempIndex: &tempIndex)
+            let name = "t\(tempIndex)"
+            tempIndex += 1
+            return EmittedScalar(lines: ey.lines + ex.lines + ["let \(name) = atan2(\(ey.result), \(ex.result))"], result: name)
         case .cond(let c, let t, let f):
             let ec = emitScalarNode(c, tempIndex: &tempIndex)
             let et = emitScalarNode(t, tempIndex: &tempIndex)
@@ -1221,14 +1479,11 @@ final class SwiftSourceGenerator {
 
     private func randomArrayExprSingle(valuesName: String, elementName: String, maxOps: Int) -> ArrayExpr {
         let totalOps = max(1, maxOps)
-        let useMapReduce: Bool
-        if totalOps <= 1 {
-            useMapReduce = false
-        }
-        else {
-            useMapReduce = Int(rng.next() % 2) == 0
-        }
-        let arrayOps = useMapReduce ? 2 : 1
+        let choiceCount = totalOps <= 1 ? 1 : 3
+        let choice = Int(rng.next() % UInt64(choiceCount))
+        let useMapReduce = choice == 0 && totalOps >= 2
+        let useSeqMinMax = choice == 1 && totalOps >= 2
+        let arrayOps = useMapReduce ? 2 : (useSeqMinMax ? 2 : 1)
         let remaining = max(0, totalOps - arrayOps)
         let scalarOps = remaining == 0 ? 0 : Int(rng.next() % UInt64(remaining + 1))
         let scalarNode = ensureVariable(randomScalarNode(vars: [elementName], ops: scalarOps), vars: [elementName])
@@ -1239,6 +1494,16 @@ final class SwiftSourceGenerator {
                 bodyLines: ["return \(valuesName).differentiableMap { \(elementName) in"]
                     + indent(emitted.lines, spaces: 4)
                     + ["    return \(emitted.result)", "}.differentiableReduce(Float.zero, +)"]
+            )
+        }
+        if useSeqMinMax {
+            let useMax = Int(rng.next() % 2) == 0
+            let op = useMax ? "max" : "min"
+            return ArrayExpr(
+                snippet: "map + seq\(useMax ? "Max" : "Min") + \(describe(scalarNode))",
+                bodyLines: ["return \(valuesName).differentiableMap { \(elementName) in"]
+                    + indent(emitted.lines, spaces: 4)
+                    + ["    return \(emitted.result)", "}.\(op)()!"]
             )
         }
         return ArrayExpr(
@@ -1297,6 +1562,18 @@ final class SwiftSourceGenerator {
         return name
     }
 
+    private func emitFloatDictionary(name: String, lines: inout [String]) -> String {
+        let count = size
+        var entries: [String] = []
+        entries.reserveCapacity(count)
+        for i in 0 ..< count {
+            let v = Float(rng.nextDouble(in: -10.0, 10.0))
+            entries.append("\(i): \(String(format: "%.6f", v))")
+        }
+        lines.append("private let \(name): [Int: Float] = [\(entries.joined(separator: ", "))]")
+        return name
+    }
+
     private func emitDoubleArray(name: String, lines: inout [String]) -> String {
         let count = size
         var values: [String] = []
@@ -1314,6 +1591,7 @@ final class SwiftSourceGenerator {
         lines.append("private let \(name): Float = \(String(format: "%.6f", value))")
         return name
     }
+
 
     private func randomOpsTarget() -> Int {
         return randomOpsTarget(minimum: 1)

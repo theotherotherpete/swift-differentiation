@@ -5,6 +5,7 @@ enum GeneratedInput {
     case singleFloat([Float])
     case pairFloat([Float], [Float])
     case singleDouble([Double])
+    case dictIntFloat([Int: Float])
 }
 
 struct GeneratedTestCase {

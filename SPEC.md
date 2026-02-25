@@ -28,6 +28,18 @@ Also include these differentiable operators/APIs from the repo where type-compat
 
 Generate ordered combinations containing up to **`--depth` operators/constructs** (default 3) working together (e.g. `map` + `*` + `zip`, or `for` + `if` + `+`). Order matters (`if + map` is distinct from `map + if`). `--depth N` creates test cases using between 1 and `N` nested operators and errors if `N < 1`.
 
+Focus on **obviously composable** operators and types:
+- Scalar/array pipelines: `+ - * / abs min max`, `if`, `for`, `map/reduce`, `zip`
+- Scalar-pair pipelines: `atan2` (composable with scalar ops and `zip`/`map`)
+- Optional pipelines: `Optional.differentiableMap` with scalar ops inside the map body
+- Update pipelines: `Array.update(at:with:)` and `Dictionary.update(at:with:)`, combined with scalar ops and conditionals to form the updated value
+- Sequence reductions: `Sequence min/max` after `map` or `for` transforms
+
+Defer or gate less-composable operators (platform/type-specific or niche) unless explicitly enabled:
+- `InlineArray` operators (Swift 6.2+/new OS only)
+- `ContiguousArray` differentiable view specifics
+- `repeatElement`/`Repeated` subscript derivative
+
 ## Non-goals
 - Proving mathematical correctness of derivatives beyond basic sanity checks.
 - Exhaustive coverage of all operators in the repository.
@@ -120,3 +132,7 @@ Generate ordered combinations containing up to **`--depth` operators/constructs*
 - Should tests be grouped by operator combinations in the report?
 - Should vector sizes be fixed per test or randomized per run?
 - Should dictionary-based operators be limited to small key sets for predictability?
+
+## Learnings and ADRs
+- Project learnings are tracked in `LEARNINGS.md`.
+- Architectural decisions are recorded under `./adr` (e.g., `adr/adr-001-benchmark-codegen.md`).
