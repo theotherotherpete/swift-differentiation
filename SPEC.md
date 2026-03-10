@@ -19,6 +19,7 @@ Also include these differentiable operators/APIs from the repo where type-compat
 - `min`, `max`, `abs`
 - `atan2`
 - `repeatElement`
+- `withUnsafeBufferPointer`-based array accessor (`unsafeBufferSum`) with custom VJP
 - `Array.update(at:with:)`
 - `Dictionary.update(at:with:)`
 - `Dictionary` subscript getter derivative
@@ -92,13 +93,14 @@ Defer or gate less-composable operators (platform/type-specific or niche) unless
 
 ## Output and Reporting
 - Save per-test results to a CSV file, with each row as:
-  `test_number,ratio,forward_seconds,reverse_seconds,combination_code_snippet`
+  `test_number,ratio,forward_seconds,reverse_seconds,combination_code_snippet,command_line`
 - Sort rows in ascending order by `ratio`.
 - CSV filename format: `<year>_<month>_<day>_<time>_<hex-seed>.csv`.
 - Emit the generated Swift source for that run as:
   `<yyyy_MM_dd_HHmmss>_<hex-seed>.swift`, stored alongside the CSV.
 - Include baseline ratios for each fundamental differentiable operator by itself on every run.
 - Baseline operator inputs must be randomized (seeded) to allow exact replay.
+- Add batched scalar baselines for each fundamental scalar operator (apply to arrays of size `--size` via `map`/`reduce`) to avoid overhead-dominated timing and provide a per-op proxy.
 - Provide summary statistics: min, max, median, p90, p99.
 - Render a histogram (bucketed, e.g. 20–40 bins) from the sorted ratios.
 - Always display a progress bar showing completed tests vs total.
@@ -109,6 +111,10 @@ Defer or gate less-composable operators (platform/type-specific or niche) unless
   `swift run Benchmarks --emit <swift-path> --seed <64-hex> --count 1000`
 - Benchmark generated tests:
   `swift run Benchmarks --seed <64-hex> --count 1000 --out <csv-path>`
+- Build configuration (default: release):
+  - If `--config` is omitted, the tool **requires** a release build and errors otherwise.
+  - Validate build configuration explicitly:
+    `swift run -c release Benchmarks --config release ...` (errors if the binary is not built in the requested config)
 - Control array sizes:
   `swift run Benchmarks --size 4096`
 - Control number of generated tests:

@@ -14,6 +14,7 @@ enum CodegenBench {
             && !args.contains("--count")
             && !args.contains("--size")
             && !args.contains("--depth")
+            && !args.contains("--config")
             && !args.contains("--out")
             && !args.contains("--emit")
             && !args.contains("-v")
@@ -25,6 +26,7 @@ enum CodegenBench {
         var count: Int = 1000
         var size: Int = 4096
         var depth: Int = 3
+        var configArg: String?
         var outPath: String?
         var emitPath: String?
         let verbose = args.contains("-v") || args.contains("--verbose")
@@ -57,6 +59,10 @@ enum CodegenBench {
                 let consumed = consumeValue(args, i)
                 if let value = consumed.value, let v = Int(value) { depth = v }
                 i = consumed.next
+            case "--config":
+                let consumed = consumeValue(args, i)
+                configArg = consumed.value
+                i = consumed.next
             case "--out":
                 let consumed = consumeValue(args, i)
                 outPath = consumed.value
@@ -72,6 +78,22 @@ enum CodegenBench {
 
         if depth < 1 {
             StdErr.write("invalid --depth (must be >= 1)")
+            exit(1)
+        }
+
+        let buildConfig = currentBuildConfiguration()
+        if let configArg {
+            let normalized = configArg.lowercased()
+            if normalized != "debug" && normalized != "release" {
+                StdErr.write("invalid --config (expected 'debug' or 'release')")
+                exit(1)
+            }
+            if normalized != buildConfig {
+                StdErr.write("requested --config \(normalized) but binary built in \(buildConfig). Re-run with `swift run -c \(normalized) Benchmarks ...`")
+                exit(1)
+            }
+        } else if buildConfig != "release" {
+            StdErr.write("defaulting to release mode; current binary is \(buildConfig). Re-run with `swift run -c release Benchmarks ...` or pass --config debug to override.")
             exit(1)
         }
 
@@ -106,7 +128,7 @@ enum CodegenBench {
 
         if verbose {
             let baselineCount = baselineTests(seed: seed, size: size).count
-            print("codegen: seed=\(actualSeedHex) count=\(count) size=\(size) out=\(outputPath) emit=\(emittedPath) baseline=\(baselineCount)")
+            print("codegen: seed=\(actualSeedHex) count=\(count) size=\(size) out=\(outputPath) emit=\(emittedPath) baseline=\(baselineCount) config=\(buildConfig)")
         }
 
         func writeGeneratedTests(source: String) {
@@ -181,6 +203,7 @@ enum CodegenBench {
         if verbose { print("benchmark: start") }
         let total = tests.count
         Progress.render(current: 0, total: total)
+        let commandLine = CommandLine.arguments.joined(separator: " ")
         var results: [ResultRow] = []
         results.reserveCapacity(tests.count)
         for (i, test) in tests.enumerated() {
@@ -193,7 +216,7 @@ enum CodegenBench {
                 test.reverse()
             }
             let ratio = reverseTime / max(forwardTime, 1e-12)
-            results.append(ResultRow(index: test.index, ratio: ratio, forward: forwardTime, reverse: reverseTime, snippet: test.snippet))
+            results.append(ResultRow(index: test.index, ratio: ratio, forward: forwardTime, reverse: reverseTime, snippet: test.snippet, commandLine: commandLine))
             Progress.render(current: i + 1, total: total)
         }
         Progress.finish(total: total)
@@ -352,7 +375,15 @@ enum Timing {
 }
 
 private func requiredCoverageCount() -> Int {
-    return 14
+    return 15
+}
+
+private func currentBuildConfiguration() -> String {
+#if DEBUG
+    return "debug"
+#else
+    return "release"
+#endif
 }
 
 // MARK: - Baseline tests
@@ -379,6 +410,30 @@ private func baselineMin(_ x: Float) -> Float { min(x, 0.25) }
 private func baselineMax(_ x: Float) -> Float { max(x, -0.25) }
 
 @differentiable(reverse)
+func unsafeBufferSumAD(_ values: [Float]) -> Float {
+    values.withUnsafeBufferPointer { buffer in
+        var sum: Float = 0
+        for i in 0 ..< buffer.count {
+            sum += buffer[i]
+        }
+        return sum
+    }
+}
+
+@derivative(of: unsafeBufferSumAD)
+func vjpUnsafeBufferSumAD(_ values: [Float]) -> (value: Float, pullback: (Float) -> [Float].TangentVector) {
+    let value = unsafeBufferSumAD(values)
+    return (value, { v in
+        Array<Float>.DifferentiableView(repeating: v, count: values.count)
+    })
+}
+
+@differentiable(reverse)
+private func baselineUnsafeBufferSum(_ values: [Float]) -> Float {
+    unsafeBufferSumAD(values)
+}
+
+@differentiable(reverse)
 private func baselineAtan2(_ x: Float) -> Float { atan2d(x, 0.75) }
 
 @differentiable(reverse)
@@ -388,6 +443,59 @@ private func baselineIf(_ x: Float) -> Float { x > 0 ? x : -x }
 private func baselineRunWithoutDerivative(_ x: Float) -> Float {
     let y = withoutDerivative(at: x)
     return y + x
+}
+
+@differentiable(reverse)
+private func baselineAddBatch(_ values: [Float]) -> Float {
+    values.differentiableMap { $0 + 1.0 }.differentiableReduce(Float.zero, +)
+}
+
+@differentiable(reverse)
+private func baselineSubBatch(_ values: [Float]) -> Float {
+    values.differentiableMap { $0 - 1.0 }.differentiableReduce(Float.zero, +)
+}
+
+@differentiable(reverse)
+private func baselineMulBatch(_ values: [Float]) -> Float {
+    values.differentiableMap { $0 * 1.5 }.differentiableReduce(Float.zero, +)
+}
+
+@differentiable(reverse)
+private func baselineDivBatch(_ values: [Float]) -> Float {
+    values.differentiableMap { $0 / 1.5 }.differentiableReduce(Float.zero, +)
+}
+
+@differentiable(reverse)
+private func baselineAbsBatch(_ values: [Float]) -> Float {
+    values.differentiableMap { abs($0) }.differentiableReduce(Float.zero, +)
+}
+
+@differentiable(reverse)
+private func baselineMinBatch(_ values: [Float]) -> Float {
+    values.differentiableMap { min($0, 0.25) }.differentiableReduce(Float.zero, +)
+}
+
+@differentiable(reverse)
+private func baselineMaxBatch(_ values: [Float]) -> Float {
+    values.differentiableMap { max($0, -0.25) }.differentiableReduce(Float.zero, +)
+}
+
+@differentiable(reverse)
+private func baselineAtan2Batch(_ values: [Float]) -> Float {
+    values.differentiableMap { atan2d($0, 0.75) }.differentiableReduce(Float.zero, +)
+}
+
+@differentiable(reverse)
+private func baselineIfBatch(_ values: [Float]) -> Float {
+    values.differentiableMap { $0 > 0 ? $0 : -$0 }.differentiableReduce(Float.zero, +)
+}
+
+@differentiable(reverse)
+private func baselineRunWithoutDerivativeBatch(_ values: [Float]) -> Float {
+    values.differentiableMap { v in
+        let y = withoutDerivative(at: v)
+        return y + v
+    }.differentiableReduce(Float.zero, +)
 }
 
 @differentiable(reverse)
@@ -537,6 +645,86 @@ private func baselineTests(seed: Seed, size: Int) -> [GeneratedTestCase] {
         ),
         GeneratedTestCase(
             index: -11,
+            snippet: "baseline:batch+",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineAddBatch(values)) },
+            reverse: { sink(pullback(at: values, of: baselineAddBatch)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -12,
+            snippet: "baseline:batch-",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineSubBatch(values)) },
+            reverse: { sink(pullback(at: values, of: baselineSubBatch)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -13,
+            snippet: "baseline:batch*",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineMulBatch(values)) },
+            reverse: { sink(pullback(at: values, of: baselineMulBatch)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -14,
+            snippet: "baseline:batch/",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineDivBatch(values)) },
+            reverse: { sink(pullback(at: values, of: baselineDivBatch)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -15,
+            snippet: "baseline:batch-abs",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineAbsBatch(values)) },
+            reverse: { sink(pullback(at: values, of: baselineAbsBatch)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -16,
+            snippet: "baseline:batch-min",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineMinBatch(values)) },
+            reverse: { sink(pullback(at: values, of: baselineMinBatch)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -17,
+            snippet: "baseline:batch-max",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineMaxBatch(values)) },
+            reverse: { sink(pullback(at: values, of: baselineMaxBatch)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -18,
+            snippet: "baseline:batch-atan2",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineAtan2Batch(values)) },
+            reverse: { sink(pullback(at: values, of: baselineAtan2Batch)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -19,
+            snippet: "baseline:batch-if",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineIfBatch(values)) },
+            reverse: { sink(pullback(at: values, of: baselineIfBatch)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -20,
+            snippet: "baseline:batch-runWithoutDerivative",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineRunWithoutDerivativeBatch(values)) },
+            reverse: { sink(pullback(at: values, of: baselineRunWithoutDerivativeBatch)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -21,
             snippet: "baseline:map+reduce",
             iterations: 200,
             input: .singleFloat(values),
@@ -544,7 +732,7 @@ private func baselineTests(seed: Seed, size: Int) -> [GeneratedTestCase] {
             reverse: { sink(pullback(at: values, of: baselineMapReduce)(1)) }
         ),
         GeneratedTestCase(
-            index: -12,
+            index: -22,
             snippet: "baseline:seqMin",
             iterations: 200,
             input: .singleFloat(values),
@@ -552,7 +740,7 @@ private func baselineTests(seed: Seed, size: Int) -> [GeneratedTestCase] {
             reverse: { sink(pullback(at: values, of: baselineSeqMin)(1)) }
         ),
         GeneratedTestCase(
-            index: -13,
+            index: -23,
             snippet: "baseline:seqMax",
             iterations: 200,
             input: .singleFloat(values),
@@ -560,7 +748,7 @@ private func baselineTests(seed: Seed, size: Int) -> [GeneratedTestCase] {
             reverse: { sink(pullback(at: values, of: baselineSeqMax)(1)) }
         ),
         GeneratedTestCase(
-            index: -14,
+            index: -24,
             snippet: "baseline:for",
             iterations: 200,
             input: .singleFloat(values),
@@ -568,7 +756,7 @@ private func baselineTests(seed: Seed, size: Int) -> [GeneratedTestCase] {
             reverse: { sink(pullback(at: values, of: baselineForSum)(1)) }
         ),
         GeneratedTestCase(
-            index: -15,
+            index: -25,
             snippet: "baseline:zip+map+reduce",
             iterations: 200,
             input: .pairFloat(a, b),
@@ -576,7 +764,7 @@ private func baselineTests(seed: Seed, size: Int) -> [GeneratedTestCase] {
             reverse: { sink(pullback(at: a, b, of: baselineZipMapReduce)(1)) }
         ),
         GeneratedTestCase(
-            index: -16,
+            index: -26,
             snippet: "baseline:optional+map",
             iterations: 400,
             input: .scalarFloat(x),
@@ -584,7 +772,7 @@ private func baselineTests(seed: Seed, size: Int) -> [GeneratedTestCase] {
             reverse: { sink(pullback(at: x, of: baselineOptionalMap)(1)) }
         ),
         GeneratedTestCase(
-            index: -17,
+            index: -27,
             snippet: "baseline:array+update",
             iterations: 200,
             input: .singleFloat(values),
@@ -592,12 +780,20 @@ private func baselineTests(seed: Seed, size: Int) -> [GeneratedTestCase] {
             reverse: { sink(pullback(at: values, of: baselineArrayUpdate)(1)) }
         ),
         GeneratedTestCase(
-            index: -18,
+            index: -28,
             snippet: "baseline:dict+update",
             iterations: 200,
             input: .dictIntFloat(dict),
             forward: { sink(baselineDictUpdate(dict)) },
             reverse: { sink(pullback(at: dict, of: baselineDictUpdate)(1)) }
+        ),
+        GeneratedTestCase(
+            index: -29,
+            snippet: "baseline:unsafeBufferSum",
+            iterations: 200,
+            input: .singleFloat(values),
+            forward: { sink(baselineUnsafeBufferSum(values)) },
+            reverse: { sink(pullback(at: values, of: baselineUnsafeBufferSum)(1)) }
         ),
     ]
 }
@@ -699,6 +895,10 @@ final class TestGenerator {
 
         let forNode = ScalarNode.op("+", .variable(.x), .constant(1.0))
         tests.append(makeArrayForCoverageTest(index: index, node: forNode))
+        index += 1
+
+        let unsafeNode = ScalarNode.op("+", .variable(.x), .constant(1.0))
+        tests.append(makeArrayUnsafeBufferCoverageTest(index: index, node: unsafeNode))
         index += 1
 
         let zipNode = ScalarNode.op("+", .variable(.a), .variable(.b))
@@ -1016,10 +1216,21 @@ final class TestGenerator {
     private func makeArrayTest(index: Int) -> GeneratedTestCase {
         let input = makeInputArray()
         let totalOps = randomOpsTarget()
-        let choiceCount = totalOps <= 1 ? 1 : 3
-        let choice = Int(rng.next() % UInt64(choiceCount))
-        let useMapReduce = choice == 0 && totalOps >= 2
-        let useSeqMinMax = choice == 1 && totalOps >= 2
+        let choice: Int
+        let useMapReduce: Bool
+        let useSeqMinMax: Bool
+        let useUnsafeBuffer: Bool
+        if totalOps <= 1 {
+            choice = Int(rng.next() % 2)
+            useMapReduce = false
+            useSeqMinMax = false
+            useUnsafeBuffer = choice == 1
+        } else {
+            choice = Int(rng.next() % 4)
+            useMapReduce = choice == 0
+            useSeqMinMax = choice == 1
+            useUnsafeBuffer = choice == 2
+        }
         let arrayOps = useMapReduce ? 2 : (useSeqMinMax ? 2 : 1)
         let remaining = max(0, totalOps - arrayOps)
         let scalarOps = remaining == 0 ? 0 : Int(rng.next() % UInt64(remaining + 1))
@@ -1030,6 +1241,9 @@ final class TestGenerator {
         }
         else if useSeqMinMax {
             snippet = "array + map + seqMinMax + \(describe(node))"
+        }
+        else if useUnsafeBuffer {
+            snippet = "array + unsafeBufferSum + \(describe(node))"
         }
         else {
             snippet = "array + for + \(describe(node))"
@@ -1060,6 +1274,22 @@ final class TestGenerator {
                     localNode.eval(xVal: v, aVal: 0, bVal: 0)
                 }
                 return useMax ? mapped.max()! : mapped.min()!
+            }
+            return GeneratedTestCase(
+                index: index,
+                snippet: snippet,
+                iterations: 200,
+                input: .singleFloat(input),
+                forward: { sink(test(values: input)) },
+                reverse: { sink(pullback(at: input, of: test)(1)) }
+            )
+        }
+        if useUnsafeBuffer {
+            @differentiable(reverse)
+            func test(values: [Float]) -> Float {
+                let localNode = withoutDerivative(at: node)
+                let sum = unsafeBufferSumAD(values)
+                return localNode.eval(xVal: sum, aVal: 0, bVal: 0)
             }
             return GeneratedTestCase(
                 index: index,
@@ -1143,6 +1373,25 @@ final class TestGenerator {
                 sum += localNode.eval(xVal: v, aVal: 0, bVal: 0)
             }
             return sum
+        }
+        return GeneratedTestCase(
+            index: index,
+            snippet: snippet,
+            iterations: 200,
+            input: .singleFloat(input),
+            forward: { sink(test(values: input)) },
+            reverse: { sink(pullback(at: input, of: test)(1)) }
+        )
+    }
+
+    private func makeArrayUnsafeBufferCoverageTest(index: Int, node: ScalarNode) -> GeneratedTestCase {
+        let input = makeInputArray()
+        let snippet = "array + unsafeBufferSum + \(describe(node))"
+        @differentiable(reverse)
+        func test(values: [Float]) -> Float {
+            let localNode = withoutDerivative(at: node)
+            let sum = unsafeBufferSumAD(values)
+            return localNode.eval(xVal: sum, aVal: 0, bVal: 0)
         }
         return GeneratedTestCase(
             index: index,
@@ -1452,16 +1701,18 @@ struct ResultRow {
     let forward: Double
     let reverse: Double
     let snippet: String
+    let commandLine: String
 }
 
 enum CSVRenderer {
     static func render(rows: [ResultRow]) -> String {
         var lines: [String] = []
         lines.reserveCapacity(rows.count + 1)
-        lines.append("test,ratio,forward_seconds,reverse_seconds,code")
+        lines.append("test,ratio,forward_seconds,reverse_seconds,code,command_line")
         for row in rows {
             let code = escape(row.snippet)
-            lines.append("\(row.index),\(row.ratio),\(row.forward),\(row.reverse),\(code)")
+            let cmd = escape(row.commandLine)
+            lines.append("\(row.index),\(row.ratio),\(row.forward),\(row.reverse),\(code),\(cmd)")
         }
         return lines.joined(separator: "\n") + "\n"
     }
@@ -1554,6 +1805,25 @@ final class SwiftSourceGenerator {
         lines.append("    return (value, { v in")
         lines.append("        let scale = v / denom")
         lines.append("        return (scale * x, scale * -y)")
+        lines.append("    })")
+        lines.append("}")
+        lines.append("")
+        lines.append("@differentiable(reverse)")
+        lines.append("private func unsafeBufferSumAD(_ values: [Float]) -> Float {")
+        lines.append("    values.withUnsafeBufferPointer { buffer in")
+        lines.append("        var sum: Float = 0")
+        lines.append("        for i in 0 ..< buffer.count {")
+        lines.append("            sum += buffer[i]")
+        lines.append("        }")
+        lines.append("        return sum")
+        lines.append("    }")
+        lines.append("}")
+        lines.append("")
+        lines.append("@derivative(of: unsafeBufferSumAD)")
+        lines.append("private func vjpUnsafeBufferSumAD(_ values: [Float]) -> (value: Float, pullback: (Float) -> [Float].TangentVector) {")
+        lines.append("    let value = unsafeBufferSumAD(values)")
+        lines.append("    return (value, { v in")
+        lines.append("        Array<Float>.DifferentiableView(repeating: v, count: values.count)")
         lines.append("    })")
         lines.append("}")
         lines.append("")
@@ -1657,6 +1927,11 @@ final class SwiftSourceGenerator {
         index += 1
 
         emitArrayForCoverageTest(index: index, lines: &lines, entries: &entries) { element in
+            .op("+", .variable(element), .constant("Float(1.0)"))
+        }
+        index += 1
+
+        emitArrayUnsafeBufferCoverageTest(index: index, lines: &lines, entries: &entries) { element in
             .op("+", .variable(element), .constant("Float(1.0)"))
         }
         index += 1
@@ -1771,6 +2046,24 @@ final class SwiftSourceGenerator {
         lines.append("    return sum")
         lines.append("}")
         entries.append("GeneratedTestCase(index: \(index), snippet: \"array + for + \(describe(node))\", iterations: 200, input: .singleFloat(\(input)), forward: { sink(\(fn)(values: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
+        lines.append("")
+    }
+
+    private func emitArrayUnsafeBufferCoverageTest(index: Int, lines: inout [String], entries: inout [String], nodeFactory: (String) -> ScalarNode) {
+        let input = emitFloatArray(name: "input\(index)", lines: &lines)
+        let fn = "testFunc\(index)"
+        let element = "s\(index)"
+        let node = nodeFactory(element)
+        let emitted = emitScalarNode(node)
+        lines.append("@differentiable(reverse)")
+        lines.append("private func \(fn)(values: [Float]) -> Float {")
+        lines.append("    let \(element) = unsafeBufferSumAD(values)")
+        for line in emitted.lines {
+            lines.append("    \(line)")
+        }
+        lines.append("    return \(emitted.result)")
+        lines.append("}")
+        entries.append("GeneratedTestCase(index: \(index), snippet: \"array + unsafeBufferSum + \(describe(node))\", iterations: 200, input: .singleFloat(\(input)), forward: { sink(\(fn)(values: \(input))) }, reverse: { sink(pullback(at: \(input), of: \(fn))(1)) })")
         lines.append("")
     }
 
@@ -2166,16 +2459,27 @@ final class SwiftSourceGenerator {
 
     private func randomArrayExprSingle(valuesName: String, elementName: String, maxOps: Int) -> ArrayExpr {
         let totalOps = max(1, maxOps)
-        let choiceCount = totalOps <= 1 ? 1 : 3
-        let choice = Int(rng.next() % UInt64(choiceCount))
-        let useMapReduce = choice == 0 && totalOps >= 2
-        let useSeqMinMax = choice == 1 && totalOps >= 2
+        let choice: Int
+        let useMapReduce: Bool
+        let useSeqMinMax: Bool
+        let useUnsafeBuffer: Bool
+        if totalOps <= 1 {
+            choice = Int(rng.next() % 2)
+            useMapReduce = false
+            useSeqMinMax = false
+            useUnsafeBuffer = choice == 1
+        } else {
+            choice = Int(rng.next() % 4)
+            useMapReduce = choice == 0
+            useSeqMinMax = choice == 1
+            useUnsafeBuffer = choice == 2
+        }
         let arrayOps = useMapReduce ? 2 : (useSeqMinMax ? 2 : 1)
         let remaining = max(0, totalOps - arrayOps)
         let scalarOps = remaining == 0 ? 0 : Int(rng.next() % UInt64(remaining + 1))
-        let scalarNode = ensureVariable(randomScalarNode(vars: [elementName], ops: scalarOps), vars: [elementName])
-        let emitted = emitScalarNode(scalarNode)
         if useMapReduce {
+            let scalarNode = ensureVariable(randomScalarNode(vars: [elementName], ops: scalarOps), vars: [elementName])
+            let emitted = emitScalarNode(scalarNode)
             return ArrayExpr(
                 snippet: "map + reduce + \(describe(scalarNode))",
                 bodyLines: ["return \(valuesName).differentiableMap { \(elementName) in"]
@@ -2186,6 +2490,8 @@ final class SwiftSourceGenerator {
         if useSeqMinMax {
             let useMax = Int(rng.next() % 2) == 0
             let op = useMax ? "max" : "min"
+            let scalarNode = ensureVariable(randomScalarNode(vars: [elementName], ops: scalarOps), vars: [elementName])
+            let emitted = emitScalarNode(scalarNode)
             return ArrayExpr(
                 snippet: "map + seq\(useMax ? "Max" : "Min") + \(describe(scalarNode))",
                 bodyLines: ["return \(valuesName).differentiableMap { \(elementName) in"]
@@ -2193,6 +2499,19 @@ final class SwiftSourceGenerator {
                     + ["    return \(emitted.result)", "}.\(op)()!"]
             )
         }
+        if useUnsafeBuffer {
+            let sumName = "s\(elementName)"
+            let sumNode = ensureVariable(randomScalarNode(vars: [sumName], ops: scalarOps), vars: [sumName])
+            let sumEmitted = emitScalarNode(sumNode)
+            return ArrayExpr(
+                snippet: "unsafeBufferSum + \(describe(sumNode))",
+                bodyLines: ["let \(sumName) = unsafeBufferSumAD(\(valuesName))"]
+                    + indent(sumEmitted.lines, spaces: 0)
+                    + ["return \(sumEmitted.result)"]
+            )
+        }
+        let scalarNode = ensureVariable(randomScalarNode(vars: [elementName], ops: scalarOps), vars: [elementName])
+        let emitted = emitScalarNode(scalarNode)
         return ArrayExpr(
             snippet: "for + \(describe(scalarNode))",
             bodyLines: ["var sum: Float = 0",
